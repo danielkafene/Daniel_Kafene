@@ -1,0 +1,2080 @@
+-- MHR pivot data with hubspot company backfill join for MQS_V2
+-- Co-authored with CoCo
+create or replace table PC_FIVETRAN_DB.YISHUANG_TEMP.MHR_PIVOT_DATA as 
+--refresh related ticket and related store_id
+with MR_DDM_TICKET_FLAGGING AS (
+WITH TMP1 AS 
+(
+    SELECT
+        B.PROPERTY_CHAIN_ID,
+        LISTAGG(DISTINCT A.merchant_id, ', ') WITHIN GROUP (ORDER BY A.merchant_id) AS merchant_id,
+        MAX(A.MERCHANT_NAME) AS MERCHANT_NAME,
+        LISTAGG(DISTINCT A.pricing_tag, ', ') WITHIN GROUP (ORDER BY A.pricing_tag) AS pricing_tags,
+        SUM(A.CONTRACTED_AMOUNT_LAST_CALENDAR_MONTH) AS CONTRACTED_AMOUNT_LAST_CALENDAR_MONTH,
+        SUM(A.MAXIMUM_CONTRACTED_AMOUNT) AS MAXIMUM_CONTRACTED_AMOUNT
+    FROM STG_STORE_HISTORY AS A
+    LEFT JOIN STG_STORE AS B ON A.ID = B.ID
+    --WHERE A.AS_OF_DATE = '2026-01-26' AND A.IS_STORE_LEVEL_BLOCKED = 'FALSE'
+    --AND A.CATEGORY_NAME = 'Jewelry'
+    GROUP BY b.PROPERTY_CHAIN_ID
+),
+TMP2 AS
+(
+SELECT 
+    B.PROPERTY_CHAIN_ID,
+    A.KEY,
+    MAX(A.TICKET_CREATED_AT) AS  TICKET_CREATED_AT
+FROM STG_STORE_RETENTION_PERIOD AS A
+LEFT JOIN STG_STORE AS B ON A.STORE_ID = B.ID
+GROUP BY 1,2
+)
+--SELECT * FROM TMP2
+,
+TMP3 AS
+(
+SELECT
+        TMP2.PROPERTY_CHAIN_ID,
+        TMP2.KEY,
+        TMP2.ticket_created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY TMP2.PROPERTY_CHAIN_ID
+            ORDER BY TMP2.ticket_created_at DESC
+        ) AS rn
+    FROM TMP2
+)
+--SELECT * FROM TMP3
+,
+tmp4a as 
+(
+    SELECT
+        A.PROPERTY_CHAIN_ID,
+        LISTAGG(A.key, ', ')
+            WITHIN GROUP (ORDER BY A.rn) AS keys_chronological
+    FROM (
+        SELECT DISTINCT
+            TMP3.PROPERTY_CHAIN_ID,
+            TMP3.key,
+            TMP3.rn
+        FROM tmp3
+    ) AS A
+    GROUP BY a.PROPERTY_CHAIN_ID
+)
+--SELECT * FROM TMP4a
+,
+tmp4b as 
+(
+    SELECT
+        tmp3.PROPERTY_CHAIN_ID,
+        tmp3.key AS most_recent_key,
+        ticket_created_at AS most_recent_key_date
+        FROM tmp3
+        WHERE rn = 1
+)
+--select * from tmp4b
+,tmp5 as
+(
+    SELECT 
+    --s.id AS store_id,
+    s.property_chain_id,
+    min(coalesce(param_1_min,2)) AS BV_MIN, max(coalesce(param_1_max,10)) AS BV_MAX
+    FROM  store_treatment.merchant_flag_treatment mft
+    LEFT JOIN stg_store s ON s.merchant_id = mft.merchant_id
+    where flag_id = 'flag_00292' and s.is_store_level_blocked = 'FALSE'
+    group by 1
+)
+SELECT TMP1.*,
+tmp4b.most_recent_key_date,
+tmp4b.most_recent_key,
+tmp4a.keys_chronological as related_keys,
+tmp5.BV_MIN,
+tmp5.BV_MAX
+FROM TMP1
+LEFT JOIN TMP4a on tmp1.property_chain_id = tmp4a.property_chain_id
+LEFT JOIN TMP4b on tmp1.property_chain_id = tmp4b.property_chain_id
+LEFT JOIN TMP5 on tmp1.property_chain_id = tmp5.property_chain_id
+ORDER BY CONTRACTED_AMOUNT_LAST_CALENDAR_MONTH DESC
+)
+,
+  ----pricing app level table----
+  store_pricing_with_pricing_tag as (
+    select
+      stg_store_history.as_of_date,
+      stg_store_history.id as store_id,
+      stg_store_history.pricing_tag as pricing_tag_sh,
+      state_tax.regulation_id as regulation_id_sh,
+      stg_store_history.merchant_fee_max,
+      stg_pricing_history.id as pricing_id,
+      stg_pricing_history.regulation_id,
+      stg_pricing_history.risk_tier as pricing_tier,
+      stg_pricing_history.turns,
+      stg_pricing_history.merchant_fee,
+      stg_pricing_history.ownership_terms,
+      stg_pricing_history.epo1_period,
+      stg_pricing_history.epo1_fee,
+      stg_pricing_history.epo1_fee_amount,
+      stg_pricing_history.epo2_price,
+      stg_pricing_history.signing_payment,
+      stg_pricing_history.pricing_tag,
+      risk_tiers.min_risk,
+      risk_tiers.max_risk
+    from
+      PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_HISTORY as STG_STORE_HISTORY
+      left join PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STATE_TAX as state_tax on stg_store_history.state = state_tax.state_code
+      left join PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_PRICING_HISTORY as stg_pricing_history on stg_store_history.as_of_date = stg_pricing_history.as_of_date
+      AND stg_store_history.pricing_tag = stg_pricing_history.pricing_tag
+      AND stg_pricing_history.deprecated_date IS NULL
+      left join PC_FIVETRAN_DB.PRODUCTION_PUBLIC.RISK_TIERS as risk_tiers on stg_pricing_history.risk_tier = risk_tiers.id
+    where
+      stg_store_history.pricing_tag is not null
+  ),
+  ----SWAP IN FLAG TABLE SUBQUERY---
+  SWAP_IN_FLAG_TABLE as (
+    SELECT
+      a.APPLICATION_ID,
+      CASE
+        WHEN (a.sim_decision = 'Approve' AND a.sim_decision_wo_swap_in = 'Decline')
+       OR (a.sim_decision = 'Decline' AND uw.final_decision = 'Approved')
+        THEN 1
+        ELSE 0
+        END AS SWAP_IN_FLAG,
+         CASE
+        WHEN (a.sim_decision = 'Approve' AND a.sim_decision_wo_swap_in = 'Decline')
+        THEN 1
+        ELSE 0
+        END AS SWAP_IN_MERCHANT_RULE_FLAG,
+      CASE
+        WHEN sim_decision = 'Approve'
+        and sim_decision_wo_swap_in <> 'Approve' THEN 1
+        ELSE 0
+      END AS SWAP_IN_FLAG_INCLUDING_PREVIOUS_MANUAL,
+      sim_decision_wo_swap_in,
+      sim_decision
+    FROM
+      (
+        select
+          a.application_ID,
+          case when flag_00274 = 1 then greatest(overlay_00132, rpc_pre_lease_appr_amt)
+else overlay_00132 end as overlay_00126,
+
+case when flag_00267 = 1 then greatest(overlay_00126, 1.1*last_approval_amount)
+else overlay_00126 end as overlay_00122,
+
+case when global_cap.merchant_id is not null then least(overlay_00122,global_cap.impact)
+else least(overlay_00122,5000) end as overlay_00047,
+
+case when counter_00001 > 0 and flag_00303*flag_00304>0 then 1000 else overlay_00047 end as overlay_00136,
+
+coalesce(prq_approval_amount, case when a.current_balance is not null then ceil( floor(greatest(overlay_00136 - a.current_balance, 0))/50)*50 else 
+ceil(floor(overlay_00136)/50)*50 end ) as overlay_00049,
+
+      
+
+
+
+    case
+        --when flag_00308 > 0 then 'Approve'
+        when flag_00285+flag_00286+flag_00299+flag_00297+flag_00272+flag_00273+flag_00300+flag_00301+flag_00302+flag_00305+flag_00306>0 then 'Decline'
+        --when flag_00289>0 and counter_00001<4 then 'Approve'
+        when flag_00312>0 then 'Approve'
+        when flag_00283*(1-flag_00292) > 0  then 'Approve'
+        when flag_00276 = 1 then 'Approve'
+        when flag_00216+flag_00217+flag_00218+flag_00291+flag_00271+flag_00284 > 0 then 'Decline'
+        when flag_00274 = 1 then 'Approve'
+        when flag_00106+flag_00222+flag_00290
+        +flag_00268+flag_00269+flag_00275+flag_00282 >0 
+        then 'Decline'
+        when flag_00259*( flag_00288*(1-flag_00072)+flag_00292 )>0 then 'Approve'
+        when flag_00260*( flag_00288*(1-flag_00072)+flag_00292 )>0 then 'Decline'
+        when flag_00288*(1-flag_00072)+flag_00292>0 then 'Manual'
+        else 'Approve'
+        end as decision_1,
+
+    case when knockout_1 = 1 then 'Decline'
+        when overlay_00049<300 then 'Decline'
+        when flag_00211 = 1 then 'Decline'
+        when flag_00267 = 1 then 'Approve'
+        when flag_00287 = 1 then 'Decline'
+        when decision_1 = 'Decline' and flag_00310>0 then 'Approve'
+        when decision_1 = 'Decline' and flag_00309>0 then 'Manual'
+        when decision_1 = 'Decline' and flag_00303*flag_00304>0 then 'Manual'
+        when decision_1 = 'Decline' and flag_00311*(1-flag_00259)*(1-flag_00260)>0 then 'Manual'
+    else decision_1 end sim_decision_wo_swap_in,
+          ----------------------------------------------
+                    case
+        when flag_00308 > 0 then 'Approve'
+        when flag_00285+flag_00286+flag_00299+flag_00297+flag_00272+flag_00273+flag_00300+flag_00301+flag_00302+flag_00305+flag_00306>0 then 'Decline'
+        when flag_00289>0 and counter_00001<4 then 'Approve'
+        when flag_00312>0 then 'Approve'
+        when flag_00283*(1-flag_00292) > 0  then 'Approve'
+        when flag_00276 = 1 then 'Approve'
+        when flag_00216+flag_00217+flag_00218+flag_00291+flag_00271+flag_00284 > 0 then 'Decline'
+        when flag_00274 = 1 then 'Approve'
+        when flag_00106+flag_00222+flag_00290
+        +flag_00268+flag_00269+flag_00275+flag_00282 >0 
+        then 'Decline'
+        when flag_00259*( flag_00288*(1-flag_00072)+flag_00292 )>0 then 'Approve'
+        when flag_00260*( flag_00288*(1-flag_00072)+flag_00292 )>0 then 'Decline'
+        when flag_00288*(1-flag_00072)+flag_00292>0 then 'Manual'
+        else 'Approve'
+        end as decision_2,
+
+    case when knockout_1 = 1 then 'Decline'
+        when overlay_00049<300 then 'Decline'
+        when flag_00211 = 1 then 'Decline'
+        when flag_00267 = 1 then 'Approve'
+        when flag_00287 = 1 then 'Decline'
+        when decision_2 = 'Decline' and flag_00310>0 then 'Approve'
+        when decision_2 = 'Decline' and flag_00309>0 then 'Manual'
+        when decision_2 = 'Decline' and flag_00303*flag_00304>0 then 'Manual'
+        when decision_2 = 'Decline' and flag_00311*(1-flag_00259)*(1-flag_00260)>0 then 'Manual'
+    else decision_2 end as sim_decision
+
+        from
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_simulation_line_prod_step3 a
+      left join stg_merchant_line_treatment_simu global_cap
+on a.merchant_id = global_cap.merchant_id
+and global_cap.treatment_type = 'glob_cap'
+and global_cap.as_of_date = a.application_date
+and (a.sim_risk_tier >= global_cap.rt_min or global_cap.rt_min is null)
+and (a.sim_risk_tier <= global_cap.rt_max or global_cap.rt_max is null)
+and (a.fraud_model_q325 >= global_cap.fraud_min or global_cap.fraud_min is null)
+and (a.fraud_model_q325 <= global_cap.fraud_max or global_cap.fraud_max is null)
+and (a.d30_90d_model_q325 >= global_cap.d30_90d_min or global_cap.d30_90d_min is null)
+and (a.d30_90d_model_q325 <= global_cap.d30_90d_max or global_cap.d30_90d_max is null)
+and (a.d30_180d_model_q325 >= global_cap.d30_180d_min or global_cap.d30_180d_min is null)
+and (a.d30_180d_model_q325 <= global_cap.d30_180d_max or global_cap.d30_180d_max is null)
+
+QUALIFY ROW_NUMBER() OVER (PARTITION BY a.application_id ORDER BY a.created_at DESC) = 1
+      ) a
+      left join stg_underwriting_metrics uw on uw.application_id = a.application_id
+  ),
+  --------swap in date subquery---
+  swap_in_date AS (
+    WITH
+      TransitionPoints AS --adds previous day credit_swap_in_grade to each row
+      (
+        SELECT
+          STORE_ID,
+          AS_OF_DATE,
+          CREDIT_SWAP_IN_GRADE,
+          LAG (CREDIT_SWAP_IN_GRADE) OVER (
+            PARTITION BY
+              STORE_ID
+            ORDER BY
+              AS_OF_DATE
+          ) AS PREV_CREDIT_SWAP_IN_GRADE
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_TREATMENT_OVERVIEW as ssto
+      ),
+      RecentTransitions AS --filters for row(s) where credit_swap_in_grade changes from null to not null
+      (
+        SELECT
+          STORE_ID,
+          AS_OF_DATE
+        FROM
+          TransitionPoints
+        WHERE
+          CREDIT_SWAP_IN_GRADE is not null
+          and PREV_CREDIT_SWAP_IN_GRADE is null
+      ),
+      MostRecentFirstActiveDay AS --select most recent date for each store_id where credit_swap_in_grade changes from null to not null
+      (
+        SELECT
+          STORE_ID,
+          MAX(AS_OF_DATE) AS FIRST_SWAP_IN_ACTIVE_DAY
+        FROM
+          RecentTransitions
+        GROUP BY
+          STORE_ID
+      ),
+      MostRecentLatestActiveDay AS (
+        SELECT
+          STORE_ID,
+          MAX(AS_OF_DATE) AS LATEST_SWAP_IN_ACTIVE_DAY
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_TREATMENT_OVERVIEW
+        WHERE
+          CREDIT_SWAP_IN_GRADE is not null
+        GROUP BY
+          STORE_ID
+      )
+    SELECT
+      a.ID AS STORE_ID,
+      b.FIRST_SWAP_IN_ACTIVE_DAY,
+      c.LATEST_SWAP_IN_ACTIVE_DAY
+    FROM
+      (
+        SELECT DISTINCT
+          ID
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE
+      ) as a
+      LEFT JOIN MostRecentFirstActiveDay as b on a.id = b.store_id
+      LEFT JOIN MostRecentLatestActiveDay as c on a.id = c.store_id
+  ),
+  ------------120 day EPO1----------
+  EPO1_120_DAY_TABLE AS (
+    WITH
+      TransitionPoints AS --adds previous day pricing_tag to each row
+      (
+        SELECT
+          ID AS STORE_ID,
+          AS_OF_DATE,
+          pricing_tag,
+          LAG (pricing_tag) OVER (
+            PARTITION BY
+              ID
+            ORDER BY
+              AS_OF_DATE
+          ) AS PREV_pricing_tag
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_store_history
+      ),
+      RecentTransitions AS --filters for row(s) where pricing_tag changes from Not 120EPO1 to 120EPO1
+      (
+        SELECT
+          STORE_ID,
+          AS_OF_DATE
+        FROM
+          TransitionPoints
+        WHERE
+          pricing_tag in (
+            select distinct
+              pricing_tag
+            from
+              PC_FIVETRAN_DB.PRODUCTION_PUBLIC.PRICING
+            where
+              pricing_tag like '%120EPO1%'
+          )
+          and PREV_pricing_tag not in (
+            select distinct
+              pricing_tag
+            from
+              PC_FIVETRAN_DB.PRODUCTION_PUBLIC.PRICING
+            where
+              pricing_tag like '%120EPO1%'
+          )
+        UNION ALL
+        SELECT
+          STORE_ID,
+          AS_OF_DATE
+        FROM
+          TransitionPoints
+        WHERE
+          pricing_tag in (
+            select distinct
+              pricing_tag
+            from
+              PC_FIVETRAN_DB.PRODUCTION_PUBLIC.PRICING
+            where
+              pricing_tag like '%120EPO1%'
+          )
+          and PREV_pricing_tag is null
+      ),
+      MostRecentFirstActiveDay AS --select most recent date for each store_id where pricing_tag changes from Not 120EPO1 to 120EPO1
+      (
+        SELECT
+          STORE_ID,
+          MAX(AS_OF_DATE) AS FIRST_PRICING_ACTIVE_DAY
+        FROM
+          RecentTransitions
+        GROUP BY
+          STORE_ID
+      ),
+      MostRecentLatestActiveDay AS --select most recent date for each store_id where pricing_tag is 120EPO1
+      (
+        SELECT
+          ID AS STORE_ID,
+          MAX(AS_OF_DATE) AS LATEST_PRICING_ACTIVE_DAY
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_HISTORY
+        WHERE
+          PRICING_TAG in (
+            select distinct
+              pricing_tag
+            from
+              PC_FIVETRAN_DB.PRODUCTION_PUBLIC.PRICING
+            where
+              pricing_tag like '%120EPO1%'
+          )
+        GROUP BY
+          STORE_ID
+      )
+    SELECT
+      a.ID AS STORE_ID,
+      b.first_pricing_active_day,
+      c.LATEST_PRICING_ACTIVE_DAY
+    FROM
+      (
+        SELECT DISTINCT
+          ID
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE
+      ) as a
+      LEFT JOIN MostRecentFirstActiveDay as b on a.id = b.store_id
+      LEFT JOIN MostRecentLatestActiveDay as c on a.id = c.store_id
+  ),
+  ------------one dollar ip ----------
+  ONE_DOLLAR_TABLE AS (
+    WITH
+      TransitionPoints AS --adds previous day pricing_tag to each row
+      (
+        SELECT
+          ID AS STORE_ID,
+          AS_OF_DATE,
+          pricing_tag,
+          LAG (pricing_tag) OVER (
+            PARTITION BY
+              ID
+            ORDER BY
+              AS_OF_DATE
+          ) AS PREV_pricing_tag
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_store_history
+      ),
+      RecentTransitions AS --filters for row(s) where pricing_tag changes from Not $1 IP to $1IP
+      (
+        SELECT
+          STORE_ID,
+          AS_OF_DATE
+        FROM
+          TransitionPoints
+        WHERE
+          pricing_tag in (
+            select distinct
+              pricing_tag
+            from
+              PC_FIVETRAN_DB.PRODUCTION_PUBLIC.PRICING
+            where
+              signing_payment = 1
+          )
+          and PREV_pricing_tag not in (
+            select distinct
+              pricing_tag
+            from
+              PC_FIVETRAN_DB.PRODUCTION_PUBLIC.PRICING
+            where
+              signing_payment = 1
+          )
+        UNION ALL
+        SELECT
+          STORE_ID,
+          AS_OF_DATE
+        FROM
+          TransitionPoints
+        WHERE
+          pricing_tag in (
+            select distinct
+              pricing_tag
+            from
+              PC_FIVETRAN_DB.PRODUCTION_PUBLIC.PRICING
+            where
+              signing_payment = 1
+          )
+          and PREV_pricing_tag is null
+      ),
+      MostRecentFirstActiveDay AS --select most recent date for each store_id where pricing_tag changes from Not $1 IP to $1IP
+      (
+        SELECT
+          STORE_ID,
+          MAX(AS_OF_DATE) AS FIRST_PRICING_ACTIVE_DAY
+        FROM
+          RecentTransitions
+        GROUP BY
+          STORE_ID
+      ),
+      MostRecentLatestActiveDay AS --select most recent date for each store_id where pricing_tag is $1IP
+      (
+        SELECT
+          ID AS STORE_ID,
+          MAX(AS_OF_DATE) AS LATEST_PRICING_ACTIVE_DAY
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_HISTORY
+        WHERE
+          PRICING_TAG in (
+            select distinct
+              pricing_tag
+            from
+              PC_FIVETRAN_DB.PRODUCTION_PUBLIC.PRICING
+            where
+              signing_payment = 1
+          )
+        GROUP BY
+          STORE_ID
+      ),
+      od_start_end_date as (
+        SELECT
+          store_id,
+          LEFT (MIN(created_at), 10) AS first_one_dollar_lease_created_at,
+          LEFT (MAX(created_at), 10) AS last_one_dollar_lease_created_at
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_LEASE
+        WHERE
+          one_dollar_ip_flag = 1
+        GROUP BY
+          1
+      )
+    SELECT
+      a.ID AS STORE_ID,
+      CASE
+        WHEN (
+          b.first_pricing_active_day = '2024-01-17'
+          or b.first_pricing_active_day is null
+        ) THEN COALESCE(
+          d.first_one_dollar_lease_created_at,
+          b.first_pricing_active_day
+        )
+        ELSE b.FIRST_PRICING_ACTIVE_DAY
+      END AS first_pricing_active_day,
+      CASE
+        WHEN (
+          c.LATEST_PRICING_ACTIVE_DAY = '2024-01-17'
+          or c.LATEST_PRICING_ACTIVE_DAY is null
+        ) THEN COALESCE(
+          d.last_one_dollar_lease_created_at,
+          c.LATEST_PRICING_ACTIVE_DAY
+        )
+        ELSE c.LATEST_PRICING_ACTIVE_DAY
+      END AS LATEST_PRICING_ACTIVE_DAY,
+    FROM
+      (
+        SELECT DISTINCT
+          ID
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE
+      ) as a
+      LEFT JOIN MostRecentFirstActiveDay as b on a.id = b.store_id
+      LEFT JOIN MostRecentLatestActiveDay as c on a.id = c.store_id
+      LEFT JOIN od_start_end_date as d on a.id = d.store_id
+  ),
+  original_pricing as (
+    select
+      lease_id,
+      JSON_EXTRACT_PATH_TEXT (contract_inputs, 'epo1_period') AS original_epo1_period,
+      JSON_EXTRACT_PATH_TEXT (contract_inputs, 'term') AS original_term,
+      ROUND(
+        JSON_EXTRACT_PATH_TEXT (contract_inputs, 'total_of_payments_base'):: float / JSON_EXTRACT_PATH_TEXT (contract_inputs, 'kafene_cash_price_base'):: float,
+        2
+      ) AS original_lease_turns,
+      ROUND(
+        JSON_EXTRACT_PATH_TEXT (contract_inputs, 'initial_payment_base'),
+        0
+      ) AS original_ip
+    from
+      PC_FIVETRAN_DB.PRODUCTION_PUBLIC.lease_contracts
+      left join PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_lease on stg_lease.id = lease_contracts.lease_id
+  ),
+  NEW_COC_MODEL_SCORE AS (
+    SELECT
+      application_id,
+      STG_STORE.STATE AS store_state,
+      d30_180d_model_q125,
+      fraud_model_q125,
+      -- New model score calculation
+      multiclass_5_current_180d_q125 * (
+        CASE
+          WHEN store_state IN ('CA') THEN 1.60
+          WHEN store_state IN ('FL') THEN 1.65
+          WHEN store_state IN ('TX') THEN 1.71
+          WHEN store_state IN ('CT', 'HI', 'IA', 'ME', 'MI', 'NY', 'OH', 'PA', 'VT') THEN 1.58
+          ELSE 1.68
+        END
+      ) + multiclass_4_dpd30_180d_q125 * (
+        CASE
+          WHEN store_state IN ('CA') THEN 0.67
+          WHEN store_state IN ('FL') THEN 0.75
+          WHEN store_state IN ('TX') THEN 0.76
+          WHEN store_state IN ('CT', 'HI', 'IA', 'ME', 'MI', 'NY', 'OH', 'PA', 'VT') THEN 0.72
+          ELSE 0.74
+        END
+      ) + multiclass_3_dpd30_90d_q125 * (
+        CASE
+          WHEN store_state IN ('CA') THEN 0.33
+          WHEN store_state IN ('FL') THEN 0.35
+          WHEN store_state IN ('TX') THEN 0.31
+          WHEN store_state IN ('CT', 'HI', 'IA', 'ME', 'MI', 'NY', 'OH', 'PA', 'VT') THEN 0.25
+          ELSE 0.34
+        END
+      ) + multiclass_2_epo1_q125 * (
+        CASE
+          WHEN store_state IN ('CA') THEN 1.00
+          WHEN store_state IN ('FL') THEN 1.06
+          WHEN store_state IN ('TX') THEN 1.05
+          WHEN store_state IN ('CT', 'HI', 'IA', 'ME', 'MI', 'NY', 'OH', 'PA', 'VT') THEN 1.06
+          ELSE 1.05
+        END
+      ) + multiclass_1_np_q125 * (
+        CASE
+          WHEN store_state IN ('CA') THEN 0.10
+          WHEN store_state IN ('FL') THEN 0.06
+          WHEN store_state IN ('TX') THEN 0.07
+          WHEN store_state IN ('CT', 'HI', 'IA', 'ME', 'MI', 'NY', 'OH', 'PA', 'VT') THEN 0.02
+          ELSE 0.07
+        END
+      ) AS COC_MODEL_SCORE
+    FROM
+      PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_METRICS
+      LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE ON STG_STORE.ID = STG_UNDERWRITING_METRICS.STORE_ID
+  ),
+  store_coc_score as (
+      WITH latest_scores AS (
+  SELECT 
+    company_id,
+    MAX(model_run_date) AS latest_date
+  FROM 
+    stg_merchant_underwriting_scores
+  GROUP BY 
+    company_id
+)
+SELECT 
+  s.id,
+  mus.final_coc_prediction as store_final_coc_prediction,
+  mus.volume_prospect_score_v0,
+  mus.merchant_quality_score,
+          CASE 
+        WHEN mus.final_coc_prediction < 1.14 then '<1.14'
+        WHEN mus.final_coc_prediction < 1.19 then '[1.14,1.19)'
+        WHEN mus.final_coc_prediction < 1.21 then '[1.19,1.21)'
+        WHEN mus.final_coc_prediction < 1.22 then '[1.21,1.22)'
+        WHEN mus.final_coc_prediction < 1.26 then '[1.22,1.26)'
+        WHEN mus.final_coc_prediction < 1.33 then '[1.26,1.33)'
+        WHEN mus.final_coc_prediction < 1.35 then '[1.33,1.35)'
+        WHEN mus.final_coc_prediction >= 1.35 then '>=1.35'
+            else null
+            end as store_final_coc_prediction_band
+FROM 
+  stg_store s
+JOIN 
+  stg_merchant_underwriting_scores mus
+  ON s.hubspot_company_id = mus.company_id
+JOIN 
+  latest_scores ls
+  ON mus.company_id = ls.company_id
+  AND mus.model_run_date = ls.latest_date
+  ),
+  activation_terms AS (
+    WITH act_s AS (
+      SELECT id, initial_activated_at::DATE act
+      FROM pc_fivetran_db.production_public.stg_store
+    ),
+    act_sh AS (
+      SELECT h.id AS store_id, h.as_of_date, h.pricing_tag, h.state
+      FROM pc_fivetran_db.production_public.stg_store_history h
+      JOIN act_s ON act_s.id = h.id
+      WHERE h.as_of_date >= act_s.act
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY h.id ORDER BY h.as_of_date) = 1
+    )
+    SELECT
+      act_sh.store_id,
+      CASE
+        WHEN MAX(IFF(p.ownership_terms = 12, 1, 0)) = 1 AND MAX(IFF(p.ownership_terms >= 18, 1, 0)) = 1 THEN '01. Both 12M & 18M'
+        WHEN MAX(IFF(p.ownership_terms = 12, 1, 0)) = 1 THEN '02. Only 12M'
+        WHEN MAX(IFF(p.ownership_terms >= 18, 1, 0)) = 1 THEN '03. Only 18M'
+        ELSE '04. Other'
+      END AS activation_term_flag,
+      CASE
+        WHEN MIN(p.epo1_period) <= 100 THEN 1
+        ELSE 0
+      END AS "epo1<=100D"
+    FROM act_sh
+    LEFT JOIN pc_fivetran_db.production_public.state_tax st ON st.state_code = act_sh.state
+    LEFT JOIN pc_fivetran_db.production_public.stg_pricing_history p
+      ON p.as_of_date = act_sh.as_of_date
+      AND p.deprecated_date IS NULL
+      AND (
+        (act_sh.pricing_tag IS NOT NULL AND p.pricing_tag = act_sh.pricing_tag)
+        OR (act_sh.pricing_tag IS NULL AND p.pricing_tag IS NULL AND p.regulation_id = st.regulation_id)
+      )
+    GROUP BY 1
+  ),
+  pivot_base AS (
+    SELECT
+      uw.application_id,
+
+CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE AS application_created_at_ymd,
+LEFT(CONVERT_TIMEZONE('America/New_York', s.initial_activated_at), 7) AS store_activated_ym,
+LEFT(CONVERT_TIMEZONE('America/New_York', uw.approval_date), 7)  AS approval_date_ym,
+CONVERT_TIMEZONE('America/New_York', uw.lease_activation_date)::DATE AS lease_activation_date_ymd,
+LEFT(CONVERT_TIMEZONE('America/New_York', uw.lease_activation_date), 7) AS lease_activation_date_ym,
+LEFT(CONVERT_TIMEZONE('America/New_York', store_level_blocked_at), 7) AS store_blocked_vintage,
+LEFT(CONVERT_TIMEZONE('America/New_York', s.most_recent_activated_at), 7) AS store_most_recent_activated_vintage,
+s.most_recent_activated_at,
+LEFT(CONVERT_TIMEZONE('America/New_York', s.initial_activated_at), 7) AS store_initial_activated_vintage,
+DATEDIFF(
+  month,
+  s.initial_activated_at,
+  uw.application_created_at
+) AS store_activated_months_by_application_date,
+
+      op.original_epo1_period,
+      op.original_term,
+      CASE
+        WHEN op.original_term <= 9 THEN '01. <=9'
+        WHEN op.original_term <= 12 THEN '02. <=12'
+        WHEN op.original_term <= 18 THEN '03. <=18'
+        WHEN op.original_term <= 24 THEN '04. <=24'
+        WHEN op.original_term <= 36 THEN '05. <=36'
+        WHEN op.original_term > 36 THEN '06. >36'
+      END AS original_term_bucket,
+      op.original_lease_turns,
+      op.original_ip,
+      CASE
+        WHEN op.original_ip < 10 THEN '01. 0-10'
+        WHEN op.original_ip < 20 THEN '02. 10-20'
+        WHEN op.original_ip < 30 THEN '03. 20-30'
+        WHEN op.original_ip < 40 THEN '04. 30-40'
+        WHEN op.original_ip < 50 THEN '05. 40-50'
+        WHEN op.original_ip < 60 THEN '06. 50-60'
+        WHEN op.original_ip < 70 THEN '07. 60-70'
+        WHEN op.original_ip < 80 THEN '08. 70-80'
+        WHEN op.original_ip < 90 THEN '09. 80-90'
+        WHEN op.original_ip <= 100 THEN '10. 90-100'
+        ELSE '11. 100+'
+      END AS original_ip_bucket,
+      case
+        when uw.vintage between '2024-01-01' and '2024-07-20' then 'before'
+        when uw.vintage between '2024-07-21' and '2025-01-31' then 'after'
+      end as tx_pricing_change_flag,
+      ev.expected_value,
+      ev.finance_cost,
+      ev.corporate_debt_finance_cost,
+      ev.warehouse_finance_cost,
+      ev.sales_cost,
+      ev.rebate_cost,
+      ev.spiff_cost,
+      ev.underwriting_cost,
+      ev.servicing_cost,
+      ev.marketing_cost,
+      ev.payment_processing_cost,
+      ev.costs,
+      lease.epo1_fee AS lease_epo1_fee,
+      lease.epo1_fee_percentage,
+      lease.payment_frequency,
+      lease.epo2_rate as lease_epo2_rate,
+      lease.epo2_price as lease_epo2_amount,   
+      lease.merchant_fee_percentage AS lease_merchant_fee_percentage,
+      uw.is_contracted:: INT AS is_leased,
+      uw.vintage,
+      uw.decision_reason,
+      uw.store_id,
+      uw.merchant_id,
+      s.property_chain_id,
+      COALESCE(s.property_chain_id, s.merchant_id) AS group_id,
+      s.merchant_name,
+      s.category_name,
+      uw.coc_numerator,
+      uw.coc_denominator,
+      uw.lease_id,
+      uw.knockout_reason,
+      second_look_flag_v_2,
+      is_manual_review,
+      uw.manual_type,
+      uw.lease_is_fpd:: INT AS lease_is_fpd,
+      uw.dollar_fpd,
+      uw.application_source,
+      vantage_score,
+      uw.risk_tier,
+      case when uw.risk_tier between 2 and 3 then '01. 2-3'
+      when uw.risk_tier between 4 and 5 then '02. 4-5'
+      when uw.risk_tier between 6 and 8 then '03. 6-8'
+      when uw.risk_tier between 9 and 10 then '04. 9-10'
+      else null
+      end as risk_tier_band,
+      uw.approval_date,
+      uw.user_ip,
+      uw.final_decision,
+      uw.lease_tier_status,
+      uw.tier_1_status,
+      uw.tier_2_status,
+      uw.tier_3_status,
+      uw.is_charged_off,
+      uw.lease_turns,
+      uw.store_risk_level AS risk_level_production,
+      uw.lease_activation_date,
+      uw.is_mature,
+      uw.lease_used_amount,
+      uw.giact_code,
+      uw.giact_veri,
+
+      CASE 
+    WHEN uw.lease_used_amount BETWEEN 0 AND 299 
+        THEN '01. (0-299)'
+    WHEN uw.lease_used_amount BETWEEN 300 AND 399 
+        THEN '02. (300-399)'
+    WHEN uw.lease_used_amount BETWEEN 400 AND 499 
+        THEN '03. (400-499)'
+    WHEN uw.lease_used_amount BETWEEN 500 AND 599 
+        THEN '04. (500-599)'
+    WHEN uw.lease_used_amount BETWEEN 600 AND 699 
+        THEN '05. (600-699)'
+    WHEN uw.lease_used_amount BETWEEN 700 AND 799 
+        THEN '06. (700-799)'
+    WHEN uw.lease_used_amount BETWEEN 800 AND 899 
+        THEN '07. (800-899)'
+    WHEN uw.lease_used_amount BETWEEN 900 AND 999 
+        THEN '08. (900-999)'
+    WHEN uw.lease_used_amount BETWEEN 1000 AND 1199 
+        THEN '09. (1000-1199)'
+    WHEN uw.lease_used_amount BETWEEN 1200 AND 1399 
+        THEN '10. (1200-1399)'
+    WHEN uw.lease_used_amount BETWEEN 1400 AND 1599 
+        THEN '11. (1400-1599)'
+    WHEN uw.lease_used_amount BETWEEN 1600 AND 1999 
+        THEN '12. (1600-1999)'
+    WHEN uw.lease_used_amount BETWEEN 2000 AND 2499 
+        THEN '13. (2000-2499)'
+    WHEN uw.lease_used_amount BETWEEN 2500 AND 2999 
+        THEN '14. (2500-2999)'
+    WHEN uw.lease_used_amount BETWEEN 3000 AND 3499 
+        THEN '15. (3000-3499)'
+    WHEN uw.lease_used_amount BETWEEN 3500 AND 3999 
+        THEN '16. (3500-3999)'
+    WHEN uw.lease_used_amount BETWEEN 4000 AND 4499 
+        THEN '17. (4000-4499)'
+    WHEN uw.lease_used_amount BETWEEN 4500 AND 4999 
+        THEN '18. (4500-4999)'
+    WHEN uw.lease_used_amount BETWEEN 5000 AND 5499 
+        THEN '19. (5000-5499)'
+    WHEN uw.lease_used_amount BETWEEN 5500 AND 5999 
+        THEN '20. (5500-5999)'
+    WHEN uw.lease_used_amount >= 6000 
+        THEN '21. (6000+)'
+END AS lease_used_amount_band_v1,
+CASE 
+    WHEN uw.lease_used_amount BETWEEN 0 AND 499 
+        THEN '01. (0-499)'
+    WHEN uw.lease_used_amount BETWEEN 500 AND 799 
+        THEN '02. (500-799)'
+    WHEN uw.lease_used_amount BETWEEN 800 AND 999 
+        THEN '03. (800-999)'
+    WHEN uw.lease_used_amount BETWEEN 1000 AND 1499 
+        THEN '04. (1000-1499)'
+    WHEN uw.lease_used_amount BETWEEN 1500 AND 1999 
+        THEN '05. (1500-1999)'
+    WHEN uw.lease_used_amount BETWEEN 2000 AND 2499 
+        THEN '06. (2000-2499)'
+    WHEN uw.lease_used_amount BETWEEN 2500 AND 2999 
+        THEN '07. (2500-2999)'
+    WHEN uw.lease_used_amount BETWEEN 3000 AND 3499 
+        THEN '08. (3000-3499)'
+    WHEN uw.lease_used_amount BETWEEN 3500 AND 3999 
+        THEN '09. (3500-3999)'
+    WHEN uw.lease_used_amount BETWEEN 4000 AND 4999 
+        THEN '10. (4000-4999)'
+    WHEN uw.lease_used_amount BETWEEN 5000 AND 5999 
+        THEN '11. (5000-5999)'
+    WHEN uw.lease_used_amount >= 6000 
+        THEN '12. (6000+)'
+END AS lease_used_amount_band_v2,
+CASE 
+    WHEN uw.approval_amount BETWEEN 0 AND 299 
+        THEN '01. (0-299)'
+    WHEN uw.approval_amount BETWEEN 300 AND 399 
+        THEN '02. (300-399)'
+    WHEN uw.approval_amount BETWEEN 400 AND 499 
+        THEN '03. (400-499)'
+    WHEN uw.approval_amount BETWEEN 500 AND 599 
+        THEN '04. (500-599)'
+    WHEN uw.approval_amount BETWEEN 600 AND 699 
+        THEN '05. (600-699)'
+    WHEN uw.approval_amount BETWEEN 700 AND 799 
+        THEN '06. (700-799)'
+    WHEN uw.approval_amount BETWEEN 800 AND 899 
+        THEN '07. (800-899)'
+    WHEN uw.approval_amount BETWEEN 900 AND 999 
+        THEN '08. (900-999)'
+    WHEN uw.approval_amount BETWEEN 1000 AND 1199 
+        THEN '09. (1000-1199)'
+    WHEN uw.approval_amount BETWEEN 1200 AND 1399 
+        THEN '10. (1200-1399)'
+    WHEN uw.approval_amount BETWEEN 1400 AND 1599 
+        THEN '11. (1400-1599)'
+    WHEN uw.approval_amount BETWEEN 1600 AND 1999 
+        THEN '12. (1600-1999)'
+    WHEN uw.approval_amount BETWEEN 2000 AND 2499 
+        THEN '13. (2000-2499)'
+    WHEN uw.approval_amount BETWEEN 2500 AND 2999 
+        THEN '14. (2500-2999)'
+    WHEN uw.approval_amount BETWEEN 3000 AND 3499 
+        THEN '15. (3000-3499)'
+    WHEN uw.approval_amount BETWEEN 3500 AND 3999 
+        THEN '16. (3500-3999)'
+    WHEN uw.approval_amount BETWEEN 4000 AND 4499 
+        THEN '17. (4000-4499)'
+    WHEN uw.approval_amount BETWEEN 4500 AND 4999 
+        THEN '18. (4500-4999)'
+    WHEN uw.approval_amount BETWEEN 5000 AND 5499 
+        THEN '19. (5000-5499)'
+    WHEN uw.approval_amount BETWEEN 5500 AND 5999 
+        THEN '20. (5500-5999)'
+    WHEN uw.approval_amount >= 6000 
+        THEN '21. (6000+)'
+END AS approval_amount_band_v1,
+CASE 
+    WHEN uw.approval_amount BETWEEN 0 AND 499 
+        THEN '01. (0-499)'
+    WHEN uw.approval_amount BETWEEN 500 AND 799 
+        THEN '02. (500-799)'
+    WHEN uw.approval_amount BETWEEN 800 AND 999 
+        THEN '03. (800-999)'
+    WHEN uw.approval_amount BETWEEN 1000 AND 1499 
+        THEN '04. (1000-1499)'
+    WHEN uw.approval_amount BETWEEN 1500 AND 1999 
+        THEN '05. (1500-1999)'
+    WHEN uw.approval_amount BETWEEN 2000 AND 2499 
+        THEN '06. (2000-2499)'
+    WHEN uw.approval_amount BETWEEN 2500 AND 2999 
+        THEN '07. (2500-2999)'
+    WHEN uw.approval_amount BETWEEN 3000 AND 3499 
+        THEN '08. (3000-3499)'
+    WHEN uw.approval_amount BETWEEN 3500 AND 3999 
+        THEN '09. (3500-3999)'
+    WHEN uw.approval_amount BETWEEN 4000 AND 4999 
+        THEN '10. (4000-4999)'
+    WHEN uw.approval_amount BETWEEN 5000 AND 5999 
+        THEN '11. (5000-5999)'
+    WHEN uw.approval_amount >= 6000 
+        THEN '12. (6000+)'
+END AS approval_amount_band_v2,
+
+
+      uw.epo1_flag,
+      uw.dpd_ever_15,
+      uw.source_details,
+      uw.dpd8_30_end,
+      uw.dpd10_45_end,
+      uw.dpd15_90_end,
+      uw.dpd30_90_end,
+      uw.dpd30_180_end,
+      uw.is_thin_file_app:: INT AS thin_file_cnt,
+      uw.is_contracted:: INT AS lease_cnt,
+      uw.lease_is_fpd:: INT AS first_payment_default,
+      uw.dpd_ever_15:: INT AS d15_ever_cnt,
+      uw.is_mature AS mature_lease_cnt,
+      CASE WHEN lease_activation_date IS NOT NULL AND stg_lease.activation_date <= CURRENT_DATE - 10 THEN 1 ELSE 0 END AS mature_lease_cnt_10_day,
+      CASE WHEN lease_activation_date IS NOT NULL AND stg_lease.activation_date <= CURRENT_DATE - 30 THEN 1 ELSE 0 END AS mature_lease_cnt_30_day,
+      CASE WHEN lease_activation_date IS NOT NULL AND stg_lease.activation_date <= CURRENT_DATE - 45 THEN 1 ELSE 0 END AS mature_lease_cnt_45_day,
+      CASE WHEN lease_activation_date IS NOT NULL AND stg_lease.activation_date <= CURRENT_DATE - 90 THEN 1 ELSE 0 END AS mature_lease_cnt_90_day,
+      merchant_tenure,
+      merchant_flag,
+      uw.income_frequency,
+      uw.simulated_risk_tier,
+      uw.simulated_decision,
+      uw.simulated_approval_amount,
+      uw.current_prospecting_zone_app,
+      uw.lease_ownership_term,
+      uw.OVERLAY_36_FLAG,
+      uw.state AS customer_state,
+      uw.sales_employee_name,
+      s.merchant_quality_score,
+      s.risk_level,
+      s.city AS store_city,
+      s.state AS store_state,
+      s.store_type,
+      s.zipcode AS store_zipcode,
+      DATEDIFF (MONTH, s.initial_activated_at, uw.application_created_at) AS app_tenure,
+      CASE WHEN uw.application_created_at <= DATEADD('DAY', 90, s.initial_activated_at) THEN 1 ELSE 0 END AS F90_Flag,
+      act.activation_term_flag,
+      act."epo1<=100D",
+      DATEDIFF (MONTH, s.initial_activated_at, CURRENT_DATE) AS store_tenure,
+      s.first_application_submitted_date,
+      s.initial_activated_at AS store_activated_at,
+      s.store_level_blocked_at,
+      s.is_store_level_blocked,
+      s.area_sales_manager,
+      s.current_prospecting_zone,
+      s.hubspot_company_id,
+      s.hubspot_deal_id,
+      s.is_reactivated_store,
+      s.contracted_non_leasable_items_last_30_days,
+      s.non_leasable_contracted_volume_last_30_days,
+      s.non_leasable_contracted_count_last_30_days,
+      s.total_contracted_amount_last_30_days,
+      s.protected_enterprise_partner,
+      s.enterprise_partners,
+      s.property_rvp_name,
+      s.risk_ops_exception_type,
+      s.cnt_tickets_confirmed_customer_never_visit_last_60_days,
+      s.pricing_tag as current_store_pricing_tag,
+      hp.pricing_tag as app_date_pricing_tag,
+      pricing.epo2_price as app_epo2_price,
+      case
+        when hp.pricing_tag is not null then 'Bespoke pricing'
+        else 'Standard pricing'
+      end as app_date_pricing_flag,
+      s.property_time_in_business_sync_,
+      i.final_projected_dollars AS yu_final_projected_dollars,
+      i.initial_lease_principle AS yu_initial_lease_principle,
+      o.sim_decision,
+      stg_lease.one_dollar_ip_flag,
+      COALESCE(disputes.cnt_dispute, 0) AS cnt_dispute,
+      COALESCE(disputes.dispute_amount, 0) AS dispute_amount,
+      case when cnt_dispute > 0 then uw.lease_used_amount else 0 end as dispute_lease_used_amount,
+      COALESCE(disputes.fraud_dispute_amount, 0) AS fraud_dispute_amount,
+      COALESCE(disputes.fraud_dispute_count, 0) AS fraud_dispute_count,
+      case when fraud_dispute_count > 0 then uw.lease_used_amount else 0 end as fraud_dispute_lease_used_amount,
+      case when a.manual_type = 'Bank Verification' then 1 else 0 end as Bank_Verification_Triggered_Flag,
+      case when a.manual_type = 'Bank Verification' and a.manual_review_finished = TRUE then 1 else 0 end as Bank_Verification_Completed_Flag,
+    -- model_score
+      uw.epo1_model_q125,
+      uw.line_util_model_q125,
+      CAST(uw.d30_90d_model_q125 AS NUMBER (18, 10)) AS d30_90d_model_q125,
+      CAST(uw.d30_180d_exfraud_clarity_model AS NUMBER (18, 10)) AS d30_180d_exfraud_clarity_model,
+      CAST(uw.fraud_model_q125 AS NUMBER (18, 10)) AS fraud_model_q125,
+      CAST(uw.d30_180d_model_q125 AS NUMBER (18, 10)) AS d30_180d_model_q125,
+    --tg_score
+      model_score.TG_D30_90D_MODEL_Q125,
+      model_score.TG_FRAUD_MODEL_Q125,
+     --q325 models
+      model_score.FRAUD_MODEL_Q325,
+      model_score.D30_90D_MODEL_Q325,
+      model_score.D30_180D_MODEL_Q325,
+      model_score.EPO1_MODEL_Q325,
+      model_score.MULC_MODEL_Q325_CUR,
+      model_score.MULC_MODEL_Q325_D30_180D,
+      model_score.MULC_MODEL_Q325_D30_90D,
+      model_score.MULC_MODEL_Q325_EPO1,
+      model_score.MULC_MODEL_Q325_NP,
+     -- model_score.FRAUD_MODEL_EXBANK_Q325,
+     -- model_score.D30_90D_MODEL_EXBANK_Q325,
+      --model_score.D30_180D_MODEL_EXBANK_Q325,
+     -- model_score.EPO1_MODEL_EXBANK_Q325,
+     -- model_score.MULC_MODEL_EXBANK_Q325_CUR,
+    --  model_score.MULC_MODEL_EXBANK_Q325_D30_180D,
+     -- model_score.MULC_MODEL_EXBANK_Q325_D30_90D,
+     -- model_score.MULC_MODEL_EXBANK_Q325_EPO1,
+    --  model_score.MULC_MODEL_EXBANK_Q325_NP,    
+      scs.store_final_coc_prediction,
+      scs.store_final_coc_prediction_band,
+      image_ms.img_score,
+      merchant_ms.coc_pred,
+      merchant_ms.pred_response_prob,
+      merchant_ms.pred_store_vol,
+
+
+     case 
+     when merchant_ms.coc_pred < 1.13 and image_ms.img_score < 1.24 then '-5'
+     when merchant_ms.coc_pred < 1.13 and (image_ms.img_score >=1.24 or image_ms.img_score is null) then '-1'
+
+     when (merchant_ms.coc_pred >= 1.13 and merchant_ms.coc_pred < 1.18) and image_ms.img_score < 1.24  then '-3'
+     when (merchant_ms.coc_pred >= 1.13 and merchant_ms.coc_pred < 1.18) and image_ms.img_score >= 1.24  then '2'
+     when (merchant_ms.coc_pred >= 1.13 and merchant_ms.coc_pred < 1.18) and image_ms.img_score is null  then '1'
+
+     when (merchant_ms.coc_pred >= 1.18 and merchant_ms.coc_pred < 1.21) and image_ms.img_score < 1.24  then '-2'
+     when (merchant_ms.coc_pred >= 1.18 and merchant_ms.coc_pred < 1.21) and (image_ms.img_score >= 1.24 or image_ms.img_score is null)  then '3'
+
+     when (merchant_ms.coc_pred >= 1.21 and merchant_ms.coc_pred < 1.26) and image_ms.img_score < 1.24  then '1'
+     when (merchant_ms.coc_pred >= 1.21 and merchant_ms.coc_pred < 1.26) and ((image_ms.img_score >= 1.24 and image_ms.img_score < 1.30) or image_ms.img_score is null) then '3'
+     when (merchant_ms.coc_pred >= 1.21 and merchant_ms.coc_pred < 1.26) and image_ms.img_score >=1.30  then '4'
+  
+     when (merchant_ms.coc_pred >= 1.26 and merchant_ms.coc_pred < 1.32) and image_ms.img_score < 1.30  then '3'
+     when (merchant_ms.coc_pred >= 1.26 and merchant_ms.coc_pred < 1.32) and (image_ms.img_score >= 1.30 or image_ms.img_score is null) then '4'
+
+     when (merchant_ms.coc_pred >= 1.32 and merchant_ms.coc_pred < 1.40) and image_ms.img_score < 1.30  then '4'
+     when (merchant_ms.coc_pred >= 1.32 and merchant_ms.coc_pred < 1.40) and (image_ms.img_score >= 1.30 or image_ms.img_score is null) then '5'
+
+     when merchant_ms.coc_pred >= 1.40 then '5'
+
+     else null
+
+     end as new_mqs,
+
+
+
+     
+      
+      -- model_score end
+case 
+    when merchant_ms.pred_response_prob < 0.11 then '01. < 0.11'
+    when merchant_ms.pred_response_prob < 0.20 then '02. [0.11-0.20)' 
+    when merchant_ms.pred_response_prob < 0.32 then '03. [0.20-0.32)' 
+    when merchant_ms.pred_response_prob < 0.50 then '04. [0.32-0.50)' 
+    when merchant_ms.pred_response_prob < 0.65 then '05. [0.50-0.65)' 
+    when merchant_ms.pred_response_prob >= 0.65 then '06. >=0.65' 
+    else null
+    end as pred_response_prob_bands,
+case 
+    when merchant_ms.pred_store_vol < 4752 then '01. < 4752'
+    when merchant_ms.pred_store_vol < 8555 then '02. [4752-8555)'
+    when merchant_ms.pred_store_vol < 15699 then '03. [8555-15699)'
+    when merchant_ms.pred_store_vol < 30086 then '04. [15699-30086)'
+    when merchant_ms.pred_store_vol < 49985 then '05. [30086-49985)'
+    when merchant_ms.pred_store_vol < 100000 then '06. [49985-100000)'
+    when merchant_ms.pred_store_vol >= 100000 then '07. >=100000'
+    else null
+    end as pred_store_vol_bands,
+    
+CASE
+  WHEN merchant_ms.coc_pred < 1.13 THEN '01. < 1.13'
+  WHEN merchant_ms.coc_pred < 1.18 THEN '02. [1.13-1.18)'
+  WHEN merchant_ms.coc_pred < 1.21 THEN '03. [1.18-1.21)'
+  WHEN merchant_ms.coc_pred < 1.26 THEN '04. [1.21-1.26)'
+  WHEN merchant_ms.coc_pred < 1.32 THEN '05. [1.26-1.32)'
+  WHEN merchant_ms.coc_pred < 1.40 THEN '06. [1.32-1.40)'
+  WHEN merchant_ms.coc_pred >= 1.40 THEN '07. >= 1.40'
+  ELSE NULL
+END AS coc_pred_score_bands,
+
+CASE
+  WHEN merchant_ms.coc_pred < 1.13 THEN '01. < 1.13'
+  WHEN merchant_ms.coc_pred < 1.15 THEN '02. [1.13-1.15)'
+  WHEN merchant_ms.coc_pred < 1.165 THEN '03. [1.15-1.165)'
+  WHEN merchant_ms.coc_pred < 1.18 THEN '04. [1.165-1.18)'
+  WHEN merchant_ms.coc_pred < 1.20 THEN '05. [1.18-1.20)'
+  WHEN merchant_ms.coc_pred < 1.21 THEN '06. [1.20-1.21)'
+  WHEN merchant_ms.coc_pred < 1.23 THEN '07. [1.21-1.23)'
+  WHEN merchant_ms.coc_pred < 1.245 THEN '08. [1.23-1.245)'
+  WHEN merchant_ms.coc_pred < 1.26 THEN '09. [1.245-1.26)'
+  WHEN merchant_ms.coc_pred < 1.28 THEN '10. [1.26-1.28)'
+  WHEN merchant_ms.coc_pred < 1.30 THEN '11. [1.28-1.30)'
+  WHEN merchant_ms.coc_pred < 1.32 THEN '12. [1.30-1.32)'
+  WHEN merchant_ms.coc_pred < 1.35 THEN '13. [1.32-1.35)'
+  WHEN merchant_ms.coc_pred < 1.375 THEN '14. [1.35-1.375)'
+  WHEN merchant_ms.coc_pred < 1.40 THEN '15. [1.375-1.40)'
+  WHEN merchant_ms.coc_pred >= 1.40 THEN '07. >= 1.40'
+  ELSE NULL
+END AS coc_pred_score_bands_v2,
+
+
+CASE
+  WHEN image_ms.img_score < 1.24 THEN '01. < 1.24'
+  WHEN image_ms.img_score < 1.30 THEN '02. [1.24-1.30)'
+  WHEN image_ms.img_score >= 1.30 THEN '03. >= 1.30'
+  ELSE NULL
+END AS image_ms_bands,
+
+CASE
+  WHEN image_ms.img_score < 1.18 THEN '01. < 1.18'
+  WHEN image_ms.img_score < 1.20 THEN '02. < [1.18-1.20)'
+  WHEN image_ms.img_score < 1.22 THEN '03. [1.20-1.22)'
+  WHEN image_ms.img_score < 1.24 THEN '04. [1.22-1.24)'
+  WHEN image_ms.img_score < 1.26 THEN '05. [1.24-1.26)'
+  WHEN image_ms.img_score < 1.28 THEN '06. [1.26-1.28)'
+  WHEN image_ms.img_score < 1.30 THEN '07. [1.28-1.30)'
+  WHEN image_ms.img_score < 1.33 THEN '08. [1.30-1.33)'
+  WHEN image_ms.img_score < 1.36 THEN '09. [1.33-1.36)'
+  WHEN image_ms.img_score < 1.39 THEN '10. [1.36-1.39)'
+  WHEN image_ms.img_score < 1.42 THEN '11. [1.39-1.42)'
+  WHEN image_ms.img_score >= 1.42 THEN '12. >= 1.42'
+  ELSE NULL
+END AS image_ms_bands_v2,
+
+      
+      --COALESCE(target.performance_flag, 0) AS performance_flag,
+      CASE 
+    WHEN s.property_chain_id IN (
+        SELECT distinct property_chain_id 
+        FROM "PC_FIVETRAN_DB"."YISHUANG_TEMP"."MHR_TARGET"
+    ) 
+    THEN 1
+    ELSE 0 
+END AS performance_flag,
+
+      --COALESCE(target.bottom100_ev_flag, 0) AS bottom100_ev_flag,
+      swp.swap_in_flag,
+      swp.SWAP_IN_MERCHANT_RULE_FLAG,
+      swp.swap_in_flag_including_previous_manual,
+      sid.first_swap_in_active_day,
+      sid.latest_swap_in_active_day,
+      mbs.merchant_behaviour_score,
+      stg_lease.epo1_period,
+      new_coc_model_score.coc_model_score,
+      od.first_pricing_active_day AS one_dollar_first_pricing_active_day,
+      od.latest_pricing_active_day AS one_dollar_latest_pricing_active_day,
+      --coc
+      coc.net_initial_lease_principle,
+      coc.predicted_co_prob,
+      coc2.mdl1_p_6_co as predicted_co_prob_new,
+      coc.final_collected AS e_project_dollar,
+      coc.net_initial_lease_principle AS e_initial_lease_principle,
+      coc2.pred_tot_collected AS project_dollar_new,
+      coc2.net_ilp AS initial_lease_principle_new,
+      
+      coc.final_co_cash,
+      coc2.predicted_collected_f6m_co as final_co_cash_6M,
+      coc.predicted_epo1_prob,
+      coc2.mdl1_p_1_epo1 as predicted_epo1_prob_new,
+      coc.predicted_epo2_prob,
+      coc2.mdl1_p_2_epo2 as predicted_epo2_prob_new,
+      coc.final_epo1_cash,
+      coc.final_epo2_cash,
+      coc2.predicted_collected_f6m_epo1 as final_epo1_cash_6M,
+      coc2.predicted_collected_f6m_epo2 as final_epo2_cash_6M,
+      coc.predicted_pif_prob,
+      coc2.mdl1_p_3_pif as predicted_pif_prob_new,
+      coc.final_pif_cash,
+      coc2.predicted_collected_f6m_pif as final_pif_cash_6M,
+      coc2.mdl1_p_4_current as current_6M,
+      coc2.mdl1_p_5_delinquent as dpd_30plus_6M,
+      epo120.first_pricing_active_day AS epo120_first_pricing_active_day,
+      epo120.latest_pricing_active_day AS epo120_latest_pricing_active_day,
+      btv2.bet_bucket,
+      case when uw.store_id in ('STR-401P4',
+'STR-R6Y6L',
+'STR-9D3YM',
+'STR-PZBUW',
+'STR-FWR4B',
+'STR-JDW3Y',
+'STR-DXCWS',
+'STR-R7F71',
+'STR-RT5H0',
+'STR-KFB0K',
+'STR-E4RAP',
+'STR-651E3',
+'STR-7XDSV',
+'STR-8123C',
+'STR-KA1BE',
+'STR-2932F',
+'STR-D6143',
+'STR-AXCPK',
+'STR-32D4F',
+'STR-8BC6A',
+'STR-844C8',
+'STR-2CF1A',
+'STR-F4E4D',
+'STR-2C3D9',
+'STR-043D5',
+'STR-DB0A6',
+'STR-A08A5',
+'STR-60B34',
+'STR-CTNWZ',
+'STR-FYV0L',
+'STR-LE7X0',
+'STR-0BV4Y',
+'STR-2A862',
+'STR-491F3',
+'STR-5CA99',
+'STR-6J5C1',
+'STR-DLJCX',
+'STR-DMMLC',
+'STR-E6627',
+'STR-U2DKG',
+'STR-USH0J',
+'STR-9C61A',
+'STR-FFA68',
+'STR-08DCA') then 'pricing_adjusted'
+else 'pricing_not_adjusted'
+end as pricing_adjust_flag,
+CASE 
+  WHEN uw.store_id IN (
+    'STR-401P4','STR-R6Y6L','STR-9D3YM','STR-PZBUW','STR-FWR4B','STR-JDW3Y','STR-DXCWS','STR-R7F71','STR-RT5H0',
+    'STR-KFB0K','STR-E4RAP','STR-651E3','STR-7XDSV','STR-8123C','STR-KA1BE','STR-2932F','STR-D6143','STR-AXCPK',
+    'STR-32D4F','STR-8BC6A','STR-844C8','STR-2CF1A','STR-F4E4D','STR-2C3D9','STR-043D5','STR-DB0A6','STR-A08A5',
+    'STR-60B34','STR-CTNWZ','STR-FYV0L','STR-LE7X0','STR-0BV4Y','STR-2A862','STR-491F3','STR-5CA99','STR-6J5C1',
+    'STR-DLJCX','STR-DMMLC','STR-E6627','STR-U2DKG','STR-USH0J','STR-9C61A','STR-FFA68','STR-08DCA'
+  ) AND uw.application_created_at < '2025-05-09' THEN '01. adjusted_before'
+
+  WHEN uw.store_id IN (
+    'STR-401P4','STR-R6Y6L','STR-9D3YM','STR-PZBUW','STR-FWR4B','STR-JDW3Y','STR-DXCWS','STR-R7F71','STR-RT5H0',
+    'STR-KFB0K','STR-E4RAP','STR-651E3','STR-7XDSV','STR-8123C','STR-KA1BE','STR-2932F','STR-D6143','STR-AXCPK',
+    'STR-32D4F','STR-8BC6A','STR-844C8','STR-2CF1A','STR-F4E4D','STR-2C3D9','STR-043D5','STR-DB0A6','STR-A08A5',
+    'STR-60B34','STR-CTNWZ','STR-FYV0L','STR-LE7X0','STR-0BV4Y','STR-2A862','STR-491F3','STR-5CA99','STR-6J5C1',
+    'STR-DLJCX','STR-DMMLC','STR-E6627','STR-U2DKG','STR-USH0J','STR-9C61A','STR-FFA68','STR-08DCA'
+  ) AND uw.application_created_at >= '2025-05-09' THEN '02. adjusted_after'
+
+  WHEN uw.store_id NOT IN (
+    'STR-401P4','STR-R6Y6L','STR-9D3YM','STR-PZBUW','STR-FWR4B','STR-JDW3Y','STR-DXCWS','STR-R7F71','STR-RT5H0',
+    'STR-KFB0K','STR-E4RAP','STR-651E3','STR-7XDSV','STR-8123C','STR-KA1BE','STR-2932F','STR-D6143','STR-AXCPK',
+    'STR-32D4F','STR-8BC6A','STR-844C8','STR-2CF1A','STR-F4E4D','STR-2C3D9','STR-043D5','STR-DB0A6','STR-A08A5',
+    'STR-60B34','STR-CTNWZ','STR-FYV0L','STR-LE7X0','STR-0BV4Y','STR-2A862','STR-491F3','STR-5CA99','STR-6J5C1',
+    'STR-DLJCX','STR-DMMLC','STR-E6627','STR-U2DKG','STR-USH0J','STR-9C61A','STR-FFA68','STR-08DCA'
+  ) AND uw.application_created_at < '2025-05-09' AND S.STATE = 'CA' THEN '03. not_adjusted_before'
+
+  WHEN uw.store_id NOT IN (
+    'STR-401P4','STR-R6Y6L','STR-9D3YM','STR-PZBUW','STR-FWR4B','STR-JDW3Y','STR-DXCWS','STR-R7F71','STR-RT5H0',
+    'STR-KFB0K','STR-E4RAP','STR-651E3','STR-7XDSV','STR-8123C','STR-KA1BE','STR-2932F','STR-D6143','STR-AXCPK',
+    'STR-32D4F','STR-8BC6A','STR-844C8','STR-2CF1A','STR-F4E4D','STR-2C3D9','STR-043D5','STR-DB0A6','STR-A08A5',
+    'STR-60B34','STR-CTNWZ','STR-FYV0L','STR-LE7X0','STR-0BV4Y','STR-2A862','STR-491F3','STR-5CA99','STR-6J5C1',
+    'STR-DLJCX','STR-DMMLC','STR-E6627','STR-U2DKG','STR-USH0J','STR-9C61A','STR-FFA68','STR-08DCA'
+  ) AND uw.application_created_at >= '2025-05-09' AND S.STATE = 'CA' THEN '04. not_adjusted_after'
+
+  ELSE NULL
+END AS CA_HIGH_EPO1_PRICING_CHANGE_FLAG,
+
+      CASE
+        WHEN s.is_store_level_blocked = FALSE
+        AND s.autofund = FALSE THEN 1
+        ELSE 0
+      END AS autofund_off_flag,
+      CASE 
+    WHEN s.merchant_id IN (
+        SELECT merchant_id
+        FROM store_treatment.merchant_flag_treatment
+        WHERE flag_id = 'flag_00289'
+    ) THEN 1 
+    ELSE 0 
+END AS swap_in_treatment_flag,
+      CASE
+        WHEN sid.first_swap_in_active_day IS NOT NULL THEN 1
+        ELSE 0
+      END AS bet_ever,
+      CASE
+        WHEN sid.latest_swap_in_active_day = CURRENT_DATE() THEN 1
+        ELSE 0
+      END AS bet_active,
+      CASE
+        WHEN uw.application_created_at < sid.first_swap_in_active_day THEN '1.before'
+        WHEN uw.application_created_at BETWEEN sid.first_swap_in_active_day
+        AND sid.latest_swap_in_active_day THEN '2.during'
+        WHEN uw.application_created_at > sid.latest_swap_in_active_day THEN '3.after'
+        ELSE NULL
+      END AS before_during_after_bet_flag,
+      CASE
+        WHEN od.first_pricing_active_day IS NOT NULL THEN 1
+        ELSE 0
+      END AS one_dollar_ip_ever,
+      CASE
+        WHEN od.latest_pricing_active_day = CURRENT_DATE() THEN 1
+        ELSE 0
+      END AS one_dollar_ip_active,
+      CASE
+        WHEN application_created_at_ymd < od.first_pricing_active_day THEN '1.before'
+        WHEN application_created_at_ymd BETWEEN od.first_pricing_active_day
+        AND od.latest_pricing_active_day THEN '2.during'
+        WHEN application_created_at_ymd > od.latest_pricing_active_day THEN '3.after'
+        ELSE NULL
+      END AS one_dollar_before_after_flag,
+      CASE
+        WHEN application_created_at_ymd < epo120.first_pricing_active_day THEN '1.before'
+        WHEN application_created_at_ymd BETWEEN epo120.first_pricing_active_day
+        AND epo120.latest_pricing_active_day THEN '2.during'
+        WHEN application_created_at_ymd > epo120.latest_pricing_active_day THEN '3.after'
+        ELSE NULL
+      END AS epo1_120day_before_after_flag,
+      CASE
+        WHEN epo120.first_pricing_active_day IS NOT NULL THEN 1
+        ELSE 0
+      END AS epo120_ever,
+      CASE
+        WHEN epo120.latest_pricing_active_day = CURRENT_DATE() THEN 1
+        ELSE 0
+      END AS epo120_active,
+      CASE
+        WHEN DATEDIFF (DAY, uw.lease_activation_date, CURRENT_DATE()) > stg_lease.epo1_period THEN 1
+        ELSE 0
+      END AS lease_past_epo1_date_flag,
+      CASE
+        WHEN lease_past_epo1_date_flag = 1 THEN e_project_dollar
+        ELSE NULL
+      END AS past_epo1_date_e_projected_dollar,
+      CASE
+        WHEN lease_past_epo1_date_flag = 1 THEN e_initial_lease_principle
+        ELSE NULL
+      END AS e_initial_lease_principle_past_epo1_period,
+      CASE
+        WHEN lease_past_epo1_date_flag = 1
+        AND uw.tier_1_status = 'Closed'
+        AND uw.tier_2_status = 'Paid Off'
+        AND uw.tier_3_status = 'EPO1' THEN e_initial_lease_principle
+        ELSE NULL
+      END AS epo1_e_initial_lease_principle_past_epo1_period,
+      CASE
+        WHEN lease_past_epo1_date_flag = 1
+        AND uw.tier_1_status = 'Closed'
+        AND uw.tier_2_status = 'Paid Off'
+        AND uw.tier_3_status = 'EPO1' THEN 1
+        ELSE 0
+      END AS epo1_cnt_lease_past_epo1_period,
+      CASE
+        WHEN uw.tier_1_status = 'Closed'
+        AND uw.tier_2_status = 'Paid Off'
+        AND uw.tier_3_status = 'EPO1' THEN e_initial_lease_principle
+        ELSE NULL
+      END AS epo1_e_initial_lease_principle,
+      CASE
+        WHEN ORIGINAL_TERM >= 18 THEN e_initial_lease_principle
+        ELSE 0
+      END AS e_initial_lease_principle_18m_term,
+      CASE
+        WHEN ORIGINAL_TERM >= 18 THEN e_project_dollar
+        ELSE 0
+      END AS e_projected_dollar_18m_term,
+      CASE
+        WHEN ORIGINAL_TERM in (12,9) THEN e_initial_lease_principle
+        ELSE 0
+      END AS e_initial_lease_principle_12m_9m_term,
+      CASE
+        WHEN ORIGINAL_TERM in (12,9) THEN e_project_dollar
+        ELSE 0
+      END AS e_projected_dollar_12m_9m_term,
+      CASE
+        WHEN ORIGINAL_TERM >= 18
+          AND uw.is_contracted::INT = 1
+        THEN 1
+        ELSE 0
+      END AS TERM_18M_LEASE_CNT,
+      CASE
+        WHEN ORIGINAL_TERM IN (12,9)
+          AND uw.is_contracted::INT = 1
+        THEN 1
+        ELSE 0
+      END AS TERM_12M_9M_LEASE_CNT,
+      
+      CASE
+        WHEN DATEDIFF (DAY, uw.approval_date, lease_activation_date) > 45 THEN 1
+        ELSE 0
+      END AS delayed_activation,
+      CASE
+        WHEN uw.lease_tier_status IN (
+          'Cancelled',
+          'Cancelled, Post-activation',
+          'Cancelled, Recontracted',
+          'Cancelled, Pre-activation'
+        ) THEN 1
+        ELSE 0
+      END AS cancelled_lease_cnt,
+      CASE
+        WHEN s.state IN (
+          'CA',
+          'CT',
+          'HI',
+          'IA',
+          'ME',
+          'MI',
+          'NY',
+          'OH',
+          'PA',
+          'VT',
+          'WV'
+        ) THEN 'Capped'
+        ELSE 'Non-Capped'
+      END AS capped_state_flag,
+      CASE
+        WHEN uw.application_id IS NOT NULL THEN 1
+        ELSE 0
+      END AS all_appl_cnt,
+      CASE
+        WHEN uw.final_decision NOT IN ('Cancelled', 'Decision Pending', 'Incomplete') THEN 1
+        ELSE 0
+      END AS appl_cnt,
+      CASE
+        WHEN dpd_ever_15 = 1 THEN e_initial_lease_principle
+        ELSE 0
+      END AS dpd15_ever_dollar_amount,
+      CASE
+        WHEN dpd8_30_end = 1 THEN e_initial_lease_principle
+        ELSE 0
+      END AS dpd8_30_end_dollar_amount,
+      CASE
+        WHEN dpd10_45_end = 1 THEN e_initial_lease_principle
+        ELSE 0
+      END AS dpd10_45_end_dollar_amount,
+        CASE
+        WHEN dpd30_90_end = 1 THEN e_initial_lease_principle
+        ELSE 0
+      END AS dpd30_90_end_dollar_amount,
+      CASE WHEN lease_activation_date IS NOT NULL AND stg_lease.activation_date <= CURRENT_DATE - 30 THEN e_initial_lease_principle ELSE null END AS mature_initial_lease_priciple_30_day,
+      CASE WHEN lease_activation_date IS NOT NULL AND stg_lease.activation_date <= CURRENT_DATE - 45 THEN e_initial_lease_principle ELSE null END AS mature_initial_lease_priciple_lease_cnt_45_day,
+      CASE WHEN lease_activation_date IS NOT NULL AND stg_lease.activation_date <= CURRENT_DATE - 90 THEN e_initial_lease_principle ELSE null END AS mature_initial_lease_priciple_lease_cnt_90_day,
+      CASE
+        WHEN uw.is_contracted = 'TRUE'
+        AND uw.risk_tier >= 6 THEN 1
+        ELSE 0
+      END AS rt6_plus_lease_cnt,
+      CASE
+        WHEN uw.risk_tier >= 6 THEN 1
+        ELSE 0
+      END AS rt6_plus_app_cnt,
+      CASE
+        WHEN uw.final_decision = 'Approved' THEN uw.approval_amount
+      END AS approval_amount,
+      CASE
+        WHEN s.waterfall IS NOT NULL THEN 1
+        ELSE 0
+      END AS waterfall_store,
+      CASE
+        WHEN uw.lease_id NOT IN ('')
+        AND vantage_score >= 300 THEN uw.vantage_score
+        ELSE NULL
+      END AS vantage_score_lease_level_sum,
+      CASE
+        WHEN uw.lease_id NOT IN ('')
+        AND vantage_score >= 300 THEN 1
+        ELSE 0
+      END AS vantage_score_lease_level_cnt,
+      CASE
+        WHEN vantage_score >= 300 THEN uw.vantage_score
+        ELSE NULL
+      END AS nz_vantage_score,
+      CASE
+        WHEN vantage_score >= 300 THEN 1
+        ELSE 0
+      END AS nz_vantage_cnt,
+      CASE
+        WHEN vantage_score < 300
+        OR vantage_score IS NULL THEN 1
+        ELSE 0
+      END AS missing_vantage_cnt,
+      CASE
+        WHEN uw.lease_id NOT IN ('') THEN uw.approval_amount
+        ELSE NULL
+      END AS approval_amount_lease_level,
+      CASE
+        WHEN uw.second_look_flag_v_2 = 'First Look' and appl_cnt = 1 THEN 1
+        ELSE 0
+      END AS first_look_cnt_new,
+      CASE
+        WHEN uw.second_look_flag_v_2 IS NOT NULL and appl_cnt = 1 THEN 1
+        ELSE 0
+      END AS first_look_cnt_deno_new,
+      CASE
+        WHEN uw.final_decision = 'Approved' THEN 1
+        ELSE 0
+      END AS approved_cnt,
+      CASE
+        WHEN uw.final_decision = 'Approved'
+        AND uw.knockout_reason IS NULL THEN 1
+        ELSE 0
+      END AS approved_cnt_exc_knockout,
+      CASE
+        WHEN uw.final_decision NOT IN ('Cancelled', 'Decision Pending', 'Incomplete')
+        AND uw.knockout_reason IS NULL THEN 1
+        ELSE 0
+      END AS appl_cnt_exc_knockout,
+      CASE
+        WHEN uw.tier_1_status = 'Active' THEN 1
+        ELSE 0
+      END AS active_cnt,
+      CASE
+        WHEN uw.lease_id NOT IN ('')
+        AND lease_activation_date IS NOT NULL THEN 1
+        ELSE 0
+      END AS activated_lease_cnt,
+      CASE
+        WHEN uw.tier_1_status = 'Closed'
+        AND uw.tier_2_status = 'Paid Off'
+        AND uw.tier_3_status = 'EPO1' THEN 1
+        ELSE 0
+      END AS epo1_cnt,
+      CASE
+        WHEN uw.tier_1_status = 'Closed'
+        AND uw.tier_2_status = 'Paid Off'
+        AND uw.tier_3_status = 'EPO2' THEN 1
+        ELSE 0
+      END AS epo2_cnt,
+      CASE
+        WHEN lease_is_never_paid = 'TRUE'
+        AND uw.application_status NOT IN ('Cancelled')
+        AND uw.first_due_date < CURRENT_DATE - 10 THEN 1
+        ELSE 0
+      END AS np_cnt,
+      CASE
+        WHEN uw.channel = 'Customer' THEN 1
+        ELSE 0
+      END AS customer_channel_cnt,
+      CASE  
+        WHEN UW.APPLICATION_ID IN (SELECT APPLICATION_ID FROM stg_formpiper_applications) THEN 1
+        ELSE 0
+      END AS formpiper_app_flag,
+      CASE 
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO < 1.00 THEN '01. <1.00'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.00 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.05 THEN '02. 1.00 - 1.05'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.05 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.10 THEN '03. 1.05 - 1.10'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.10 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.15 THEN '04. 1.10 - 1.15'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.15 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.20 THEN '05. 1.15 - 1.20'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.20 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.25 THEN '06. 1.20 - 1.25'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.25 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.30 THEN '07. 1.25 - 1.30'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.30 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.35 THEN '08. 1.30 - 1.35'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.35 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.40 THEN '09. 1.35 - 1.40'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.40 THEN '10. >1.40'
+    ELSE NULL
+END AS ZONE_COC_BAND_1,
+
+  CASE 
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO < 1.15 THEN '01. <1.15'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.15 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.18 THEN '02. 1.15 - 1.18'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.18 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.21 THEN '03. 1.18 - 1.21'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.21 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.24 THEN '04. 1.21 - 1.24'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.24 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.27 THEN '05. 1.24 - 1.27'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.27 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.30 THEN '06. 1.27 - 1.30'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.30 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.33 THEN '07. 1.30 - 1.33'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.33 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.36 THEN '08. 1.33 - 1.36'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.36 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.39 THEN '09. 1.36 - 1.39'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.39 THEN '10. >=1.39'
+    ELSE NULL
+END AS ZONE_COC_BAND_2,
+         CASE
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO < 1.00 THEN '01. <1.00'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.00 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.05 THEN '02. 1.00 - 1.05'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.05 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.10 THEN '03. 1.05 - 1.10'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.10 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.11 THEN '04. 1.10 - 1.11'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.11 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.12 THEN '05. 1.11 - 1.12'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.12 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.13 THEN '06. 1.12 - 1.13'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.13 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.14 THEN '07. 1.13 - 1.14'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.14 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.15 THEN '08. 1.14 - 1.15'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.15 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.16 THEN '09. 1.15 - 1.16'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.16 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.17 THEN '10. 1.16 - 1.17'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.17 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.18 THEN '11. 1.17 - 1.18'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.18 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.19 THEN '12. 1.18 - 1.19'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.19 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.20 THEN '13. 1.19 - 1.20'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.20 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.21 THEN '14. 1.20 - 1.21'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.21 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.22 THEN '15. 1.21 - 1.22'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.22 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.23 THEN '16. 1.22 - 1.23'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.23 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.24 THEN '17. 1.23 - 1.24'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.24 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.25 THEN '18. 1.24 - 1.25'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.25 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.26 THEN '19. 1.25 - 1.26'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.26 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.27 THEN '20. 1.26 - 1.27'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.27 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.28 THEN '21. 1.27 - 1.28'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.28 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.29 THEN '22. 1.28 - 1.29'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.29 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.30 THEN '23. 1.29 - 1.30'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.30 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.31 THEN '24. 1.30 - 1.31'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.31 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.32 THEN '25. 1.31 - 1.32'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.32 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.33 THEN '26. 1.32 - 1.33'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.33 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.34 THEN '27. 1.33 - 1.34'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.34 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.35 THEN '28. 1.34 - 1.35'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.35 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.36 THEN '29. 1.35 - 1.36'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.36 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.37 THEN '30. 1.36 - 1.37'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.37 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.38 THEN '31. 1.37 - 1.38'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.38 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.39 THEN '32. 1.38 - 1.39'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.39 AND ZONE_COC.MRISK_COC_PRED_RETRO < 1.40 THEN '33. 1.39 - 1.40'
+    WHEN ZONE_COC.MRISK_COC_PRED_RETRO >= 1.40 THEN '34. >1.40'
+    ELSE NULL
+END AS ZONE_COC_BAND_3,
+
+CASE
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             BETWEEN CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE
+                 AND DATEADD(day, 7, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+            THEN 'Day 1-7'
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             > DATEADD(day, 7, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+         AND CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             <= DATEADD(day, 14, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+            THEN 'Day 8-14'
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             > DATEADD(day, 14, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+         AND CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             <= DATEADD(day, 30, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+            THEN 'Day 15-30'
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             > DATEADD(day, 30, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+         AND CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             <= DATEADD(day, 60, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+            THEN 'Day 31-60'
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             > DATEADD(day, 60, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+         AND CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             <= DATEADD(day, 90, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+            THEN 'Day 61-90'
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             > DATEADD(day, 90, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+         AND CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             <= DATEADD(day, 180, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+            THEN 'Day 91-180'
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             > DATEADD(day, 180, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+         AND CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             <= DATEADD(day, 365, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+            THEN 'Day 181-365'
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             > DATEADD(day, 365, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+         AND CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             <= DATEADD(day, 730, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+            THEN 'Day 366-730'
+        ELSE 'Out of Range'
+    END AS application_snapshot_bucket,
+
+    CASE
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             BETWEEN CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE
+                 AND DATEADD(day, 180, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+        THEN 1 ELSE 0
+    END AS day_1_180,
+
+    CASE
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             BETWEEN CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE
+                 AND DATEADD(day, 365, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+        THEN 1 ELSE 0
+    END AS day_1_365,
+
+    CASE
+        WHEN CONVERT_TIMEZONE('America/New_York', uw.application_created_at)::DATE
+             BETWEEN CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE
+                 AND DATEADD(day, 730, CONVERT_TIMEZONE('America/New_York', s.initial_activated_at)::DATE)
+        THEN 1 ELSE 0
+    END AS day_1_730,
+swapin.swapin_group_flag,
+
+    ZONE_COC.MRISK_COC_PRED_RETRO,
+    --swap_sim.SWAP_IN_MERCHANT_RULE_FLAG as swap_in_merchant_rule_flag_simulated
+    uw.channel
+
+    FROM
+        PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_METRICS uw
+     -- left join PC_FIVETRAN_DB.YISHUANG_TEMP.step6_TODAY_11112025 swap_sim on swap_sim.application_id = uw.application_id
+      left join
+    stg_application_model_scores_hourly as model_score
+    on uw.application_id = model_score.application_id
+      left join (with base as(
+SELECT 
+        s.merchant_id,
+--
+        CASE 
+            WHEN param_1_min = 1.147 AND param_1_max IS NULL AND param_2_min IS NULL AND param_2_max = 0.0331 THEN '01'
+            WHEN param_1_min = 1.147 AND param_1_max IS NULL AND param_2_min = 0.0331 AND param_2_max IS NULL THEN '02'
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min IS NULL AND param_2_max = 0.0331 THEN '03'
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min = 0.0331 AND param_2_max = 0.0758 THEN '04'
+            WHEN param_1_min = 1.0144 AND param_1_max = 1.0904 AND param_2_min IS NULL AND param_2_max = 0.0671 THEN '05'
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min IS NULL AND param_2_max = 0.0417 THEN '06'
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min = 0.0758 AND param_2_max IS NULL THEN '07'
+            WHEN param_1_min = 1.0144 AND param_1_max = 1.0904 AND param_2_min = 0.0671 AND param_2_max IS NULL THEN '08'
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min = 0.0417 AND param_2_max = 0.0758 THEN '09'
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min IS NULL AND param_2_max = 0.0671 THEN '10'
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min = 0.0758 AND param_2_max IS NULL THEN '11'
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min = 0.0671 AND param_2_max = 0.1017 THEN '12'
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min = 0.1017 AND param_2_max IS NULL THEN '13'
+            ELSE NULL
+        END AS TREATMENT_GRADE
+ --       MIN(t.as_of_date),
+--        MAX(t.as_of_date)
+    FROM stg_underwriting_merchant_flag_treatment t
+    left JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_store s ON s.merchant_id = t.merchant_id
+    WHERE t.flag_id = 'flag_00289' and treatment_grade is not null
+    GROUP BY s.merchant_id,
+             CASE 
+                WHEN param_1_min = 1.147 AND param_1_max IS NULL AND param_2_min IS NULL AND param_2_max = 0.0331 THEN '01'
+            WHEN param_1_min = 1.147 AND param_1_max IS NULL AND param_2_min = 0.0331 AND param_2_max IS NULL THEN '02'
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min IS NULL AND param_2_max = 0.0331 THEN '03'
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min = 0.0331 AND param_2_max = 0.0758 THEN '04'
+            WHEN param_1_min = 1.0144 AND param_1_max = 1.0904 AND param_2_min IS NULL AND param_2_max = 0.0671 THEN '05'
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min IS NULL AND param_2_max = 0.0417 THEN '06'
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min = 0.0758 AND param_2_max IS NULL THEN '07'
+            WHEN param_1_min = 1.0144 AND param_1_max = 1.0904 AND param_2_min = 0.0671 AND param_2_max IS NULL THEN '08'
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min = 0.0417 AND param_2_max = 0.0758 THEN '09'
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min IS NULL AND param_2_max = 0.0671 THEN '10'
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min = 0.0758 AND param_2_max IS NULL THEN '11'
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min = 0.0671 AND param_2_max = 0.1017 THEN '12'
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min = 0.1017 AND param_2_max IS NULL THEN '13'
+                ELSE NULL
+            END
+)
+            select merchant_id,max(treatment_grade) as swapin_group_flag from base where merchant_id is not null group by 1
+            ) swapin on swapin.merchant_id = uw.merchant_id
+      LEFT JOIN "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."STG_STORE" AS s ON uw.store_id = s.id
+      LEFT JOIN activation_terms act ON act.store_id = s.id
+      LEFT JOIN "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."APPLICATIONS" AS a ON a.id = uw.application_id
+      LEFT JOIN  PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_PRICING_HISTORY AS pricing   
+        ON pricing.id = a.pricing_id
+        AND pricing.as_of_date = CURRENT_DATE()
+      LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_LEASE ON PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_LEASE.ID = UW.LEASE_ID
+      left join
+    (
+        select
+            application_id,
+            decision_engine_request,
+            raw_data_pool,
+            feature_store,
+            model_scores,
+            decision_engine_output,
+            metadata
+        from stg_uw_make_decision_archive_prod
+        qualify
+            row_number() over (
+                partition by application_id
+                order by
+                    metadata:decision_engine.start_time desc, decision_engine_output
+            )
+            = 1
+    ) uw_s3
+    on uw.application_id = uw_s3.application_id
+      LEFT JOIN original_pricing OP ON OP.LEASE_ID = UW.LEASE_ID
+      LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.LEASE ON LEASE.ID = UW.LEASE_ID
+      LEFT JOIN s3.merchant_risk_tire_appliance_zone_20230707 AS zone_coc on zone_coc.zipcode = s.zipcode
+      LEFT JOIN ONE_DOLLAR_TABLE AS od ON od.store_id = uw.store_id
+      LEFT JOIN STORE_COC_SCORE AS scs on scs.id = uw.store_id
+      LEFT JOIN EPO1_120_DAY_TABLE AS epo120 ON epo120.store_id = uw.store_id
+
+      
+      left join risk_modeling.kafene_stores_image_model_scores image_ms on image_ms.store_id = uw.store_id
+
+      
+      left join risk_modeling.lto_competitor_score_scores_20250911_sw_rev merchant_ms on merchant_ms.kafene_store_id = uw.store_id
+      left join (
+  select
+    customer.description as application_id,
+    count(dispute.id) as cnt_dispute,
+    sum(dispute.amount)/100 as dispute_amount,
+    sum(case when dispute.reason = 'fraudulent' then dispute.amount else 0 end)/100 as fraud_dispute_amount,
+    count(case when dispute.reason = 'fraudulent' then dispute.id else null end) as fraud_dispute_count
+  from stripe.customer
+  left join stripe.charge on customer.id = charge.customer_id
+  left join stripe.dispute on charge.id = dispute.charge_id
+  group by application_id
+) disputes ON UW.application_id = disputes.application_id
+      LEFT JOIN (
+        SELECT application_id, final_projected_dollars, initial_lease_principle
+        FROM STG_COC_PROJECTIONS_RISK
+        WHERE current_value_flag = 1
+        ) AS i ON i.application_id = uw.application_id
+      --LEFT JOIN "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."APPLICATIONS" AS appl ON appl.id = uw.application_id
+      LEFT JOIN (
+        SELECT DISTINCT
+          application_id,
+          sim_decision
+        FROM
+          PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UW_SIMULATION_PROD_FINAL
+      ) AS o ON o.application_id = uw.application_id
+      LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.TBL_COC_FULL_POPULATION AS coc ON coc.application_id = uw.application_id
+            LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.TBL_COC_FULL_POPULATION_V2 AS coc2 ON coc2.application_id = uw.application_id
+      LEFT JOIN SWAP_IN_FLAG_TABLE AS swp ON swp.application_id = uw.application_id
+      LEFT JOIN SWAP_IN_DATE AS SID ON SID.store_id = uw.store_id
+      LEFT JOIN PC_FIVETRAN_DB.NATHAN_TEMP.BUCKET_TABLE_V2 AS btv2 ON uw.store_id = btv2.store_id
+      LEFT JOIN (
+        SELECT
+          *
+        FROM
+          pc_fivetran_db.production_public.stg_merchant_behavior_score
+        WHERE
+          as_of_date = current_date()
+      ) MBS ON MBS.STORE_ID = uw.store_id
+      LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.tbl_app_expected_value EV ON EV.APPLICATION_ID = UW.APPLICATION_ID
+      LEFT JOIN NEW_COC_MODEL_SCORE ON NEW_COC_MODEL_SCORE.APPLICATION_ID = UW.APPLICATION_ID
+      LEFT JOIN store_pricing_with_pricing_tag HP on UW.store_id = HP.store_id
+      and HP.pricing_tag is not null
+      AND CASE
+        WHEN UW.lease_id IS NOT NULL THEN UW.lease_contracted_date:: date = HP.as_of_date - 1
+        ELSE UW.application_created_at:: date = HP.as_of_date - 1
+      END
+      AND UW.risk_tier BETWEEN HP.min_risk
+      and HP.max_risk
+    WHERE UW.vintage >= '2021-01'
+    AND UW.merchant_id NOT IN ('MER-F2EE0')
+  ),
+  merchant_store_cnt AS (
+    SELECT
+      merchant_id,
+      COUNT(id) AS merchant_store_id_count
+    FROM
+      "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."STG_STORE"
+    WHERE
+      IS_STORE_LEVEL_BLOCKED = 'FALSE'
+    GROUP BY
+      1
+  ),
+  chain_store_cnt AS (
+    SELECT
+      property_chain_id,
+      COUNT(id) AS chain_store_id_count
+    FROM
+      "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."STG_STORE"
+    WHERE
+      IS_STORE_LEVEL_BLOCKED = 'FALSE'
+    GROUP BY
+      1
+  ),
+  cbb_score AS (
+    SELECT
+      LEFT (_file, 9) AS application_id,
+      TO_NUMBER (xml_response: clear_bank_behavior.cbb_score2) AS cbb_score_2,
+      SUM(
+        CASE
+          WHEN cbb_score_2 IS NULL THEN 1
+          ELSE 0
+        END
+      ) AS missing_cbb_cnt
+    FROM
+      s3.clarity_s_3
+    GROUP BY
+      1,
+      2
+  ),
+  MR_table AS (
+    SELECT
+      store_id,
+      MAX(INITIAL_EXECUTION_DATE) AS recent_INITIAL_EXECUTION_DATE
+    FROM
+      PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_RETENTION_PERIOD
+    GROUP BY
+      1
+  )
+SELECT DISTINCT
+  a.*,
+  case when swap_in_merchant_rule_flag = 1 then sig.swap_in_treatment_group else null end as swap_in_treatment_group,
+  COALESCE(
+    CC.chain_store_id_count,
+    c.merchant_store_id_count
+  ) AS multi_store_cnt,
+  cbb.cbb_score_2,
+  cbb.missing_cbb_cnt,
+  max_tickets.key AS SMR_ticket,
+  max_tickets.status AS SMR_status,
+  max_tickets.goal_of_request,
+  case
+    when max_tickets.key is not null then 1
+    else 0
+  end as ticket_ever_flag,
+  max_tickets.TICKET_CREATED_AT AS SMR_ticket_CREATED_AT,
+  final_store_tier,
+  is_undergoing_treatment,
+  is_initial_tier,
+  FIST_TIME_REFRESH_AFTER_TREATMENT_PERIOD,
+  tr.min_monthly_vol,
+  tr.adjustments,
+  CASE
+    WHEN APPLICATION_CREATED_AT_YMD BETWEEN BET_OPEN_DATE AND COALESCE (BET_CLOSE_DATE, CURRENT_DATE) THEN 1
+    ELSE 0
+  END AS APPS_DURING_SWAP_IN_TREATMENT_FLAG,
+  SFT.BET_OPEN_DATE,
+  SFT.bet_active as store_bet_active,
+ MDTF.related_keys,
+ MDTF.most_recent_key_date,
+ MDTF.most_recent_key,
+ -- CASE
+ --   WHEN MDTF.related_keys IS NULL THEN NULL
+--    WHEN MDTF.RELATED_KEYS IS NOT NULL THEN MDTF.related_store_id
+ -- END AS related_store_id,
+  case
+    when a.store_id = TR.STORE_ID then 1
+    else 0
+  end as treatment_review_flag,
+  case
+    when application_created_at_ymd <= protection_window_start then 'before'
+    when application_created_at_ymd > protection_window_start then 'during'
+    else null
+  end as treatment_before_during,
+
+CASE
+    WHEN MS.coc_proj_simple >= 1.147 AND MS.FRAUD_MODEL_Q325 <= 0.0331 THEN 1
+    WHEN MS.coc_proj_simple >= 1.147 AND MS.FRAUD_MODEL_Q325 > 0.0331 THEN 2
+
+    WHEN MS.coc_proj_simple >= 1.0904 AND MS.coc_proj_simple < 1.147 
+         AND MS.FRAUD_MODEL_Q325 <= 0.0331 THEN 3
+
+    WHEN MS.coc_proj_simple >= 1.0904 AND MS.coc_proj_simple < 1.147 
+         AND MS.FRAUD_MODEL_Q325 > 0.0331 AND MS.FRAUD_MODEL_Q325 <= 0.0758 THEN 4
+
+    WHEN MS.coc_proj_simple >= 1.0144 AND MS.coc_proj_simple < 1.0904 
+         AND MS.FRAUD_MODEL_Q325 <= 0.0671 THEN 5
+
+    WHEN MS.coc_proj_simple >= 0.9765 AND MS.coc_proj_simple < 1.0144 
+         AND MS.FRAUD_MODEL_Q325 <= 0.0417 THEN 6
+
+    WHEN MS.coc_proj_simple >= 1.0904 AND MS.coc_proj_simple < 1.147 
+         AND MS.FRAUD_MODEL_Q325 > 0.0758 THEN 7
+
+    WHEN MS.coc_proj_simple >= 1.0144 AND MS.coc_proj_simple < 1.0904 
+         AND MS.FRAUD_MODEL_Q325 > 0.0671 THEN 8
+
+    WHEN MS.coc_proj_simple >= 0.9765 AND MS.coc_proj_simple < 1.0144 
+         AND MS.FRAUD_MODEL_Q325 > 0.0417 AND MS.FRAUD_MODEL_Q325 <= 0.0758 THEN 9
+
+    WHEN MS.coc_proj_simple < 0.9765 
+         AND MS.FRAUD_MODEL_Q325 <= 0.0671 THEN 10
+
+    WHEN MS.coc_proj_simple >= 0.9765 AND MS.coc_proj_simple < 1.0144 
+         AND MS.FRAUD_MODEL_Q325 > 0.0758 THEN 11
+
+    WHEN MS.coc_proj_simple < 0.9765 
+         AND MS.FRAUD_MODEL_Q325 > 0.0671 AND MS.FRAUD_MODEL_Q325 <= 0.1017 THEN 12
+
+    WHEN MS.coc_proj_simple < 0.9765 
+         AND MS.FRAUD_MODEL_Q325 > 0.1017 THEN 13
+END AS APP_LEVEL_SWAP_IN_GROUP,
+
+      COALESCE(prod_v2.MERCHANT_QUALITY_SCORE, retro_v2.MQS_GEN2) AS MQS_V2_PROD_AND_RETRO,
+      CASE
+        WHEN prod_v2.MERCHANT_QUALITY_SCORE IS NOT NULL
+          THEN TRY_CAST(PARSE_JSON(prod_v2.MODEL_SCORES):coc_score::VARCHAR AS NUMBER(18,5))
+        ELSE retro_v2.COC_SCORE
+      END AS MQS_Proj_COC,
+      ms.coc_proj_simple as uw_proj_coc,
+      deal.PROPERTY_TERMINATION_REASON
+
+  
+FROM
+  pivot_base a
+  LEFT JOIN merchant_store_cnt c ON a.merchant_id = c.merchant_id
+  LEFT JOIN chain_store_cnt CC ON Cc.PROPERTY_CHAIN_ID = A.PROPERTY_CHAIN_ID
+  LEFT JOIN cbb_score cbb ON cbb.application_id = a.application_id
+  left join stg_uw_simulation_prod_final ff on ff.APPLICATION_ID = a.APPLICATION_ID
+  LEFT JOIN (
+    SELECT
+  store_id,
+  MAX(MINIMUM_MONTHLY_KAFENE_VOLUME_EXPECTED_FROM_THIS_STORE) AS min_monthly_vol,
+  '[' || LISTAGG('"' || labels || '"', ', ') || ']' AS ADJUSTMENTS,
+  MIN(protection_window_start) AS protection_window_start
+FROM
+  PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_RETENTION_PERIOD
+WHERE
+  protection_expiration_date > CURRENT_DATE
+GROUP BY
+  store_id
+  ) TR ON TR.STORE_ID = A.STORE_ID
+  LEFT JOIN (
+    SELECT
+      STORE_ID,
+      final_store_tier,
+      is_undergoing_treatment,
+      is_initial_tier,
+      FIST_TIME_REFRESH_AFTER_TREATMENT_PERIOD
+    FROM
+      PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_store_tiers_calculations
+    WHERE
+      AS_OF_DATE = DATE_TRUNC ('month', CURRENT_DATE)
+  ) st ON st.store_id = a.store_id
+  LEFT JOIN (
+             SELECT
+            store_id,
+            key,
+            status,
+            TICKET_CREATED_AT,
+            INITIAL_EXECUTION_DATE,
+            goal_of_request,
+            MAX_MONTHLY_POTENTIAL_LTO_VOLUME_FROM_THIS_STORE
+        FROM (
+            SELECT
+                store_id,
+                key,
+                status,
+                TICKET_CREATED_AT,
+                INITIAL_EXECUTION_DATE,
+                goal_of_request,
+                MAX_MONTHLY_POTENTIAL_LTO_VOLUME_FROM_THIS_STORE,
+                ROW_NUMBER() OVER (PARTITION BY store_id ORDER BY TICKET_CREATED_AT DESC) AS rn
+            FROM
+                PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_store_retention_period WHERE LEFT(KEY,3) in ('SMR','DDM','MHR') AND STATUS not in ('Do Nothing','TURNED OFF')
+        ) subquery
+        WHERE
+            subquery.rn <= 1
+  ) AS max_tickets ON max_tickets.store_id = a.store_id
+  LEFT JOIN PC_FIVETRAN_DB.NATHAN_TEMP.SUPERCHARGE_FLAG_TABLE SFT ON SFT.STORE_ID = A.STORE_ID
+  LEFT JOIN (select application_id,COC_PROJ_SIMPLE,FRAUD_MODEL_Q325 from stg_simulation_attributes_prod) MS ON MS.APPLICATION_ID = A.APPLICATION_ID
+  LEFT JOIN MR_DDM_TICKET_FLAGGING MDTF ON A.property_chain_id = mdtf.property_chain_id
+  LEFT JOIN (SELECT 
+    merchant_id,
+    MAX(treatment_group) AS swap_in_treatment_group
+FROM (
+    SELECT 
+        s.merchant_id AS merchant_id,
+        CASE 
+            WHEN param_1_min = 1.147 AND param_1_max IS NULL AND param_2_min IS NULL AND param_2_max = 0.0331 THEN 1
+            WHEN param_1_min = 1.147 AND param_1_max IS NULL AND param_2_min = 0.0331 AND param_2_max IS NULL THEN 2
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min IS NULL AND param_2_max = 0.0331 THEN 3
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min = 0.0331 AND param_2_max = 0.0758 THEN 4
+            WHEN param_1_min = 1.0144 AND param_1_max = 1.0904 AND param_2_min IS NULL AND param_2_max = 0.0671 THEN 5
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min IS NULL AND param_2_max = 0.0417 THEN 6
+            WHEN param_1_min = 1.0904 AND param_1_max = 1.1470 AND param_2_min = 0.0758 AND param_2_max IS NULL THEN 7
+            WHEN param_1_min = 1.0144 AND param_1_max = 1.0904 AND param_2_min = 0.0671 AND param_2_max IS NULL THEN 8
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min = 0.0417 AND param_2_max = 0.0758 THEN 9
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min IS NULL AND param_2_max = 0.0671 THEN 10
+            WHEN param_1_min = 0.9765 AND param_1_max = 1.0144 AND param_2_min = 0.0758 AND param_2_max IS NULL THEN 11
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min = 0.0671 AND param_2_max = 0.1017 THEN 12
+            WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min = 0.1017 AND param_2_max IS NULL THEN 13
+        END AS treatment_group
+    FROM store_treatment.merchant_flag_treatment mft
+    LEFT JOIN stg_store s 
+        ON s.merchant_id = mft.merchant_id
+
+   -- WHERE flag_id = 'flag_00289'
+)
+GROUP BY merchant_id) as SIG on SIG.MERCHANT_ID = A.MERCHANT_ID
+  LEFT JOIN (
+    SELECT COMPANY_ID, MERCHANT_QUALITY_SCORE, MODEL_SCORES
+    FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_MERCHANT_UNDERWRITING_SCORES_V2
+    WHERE MODEL_VERSION = 'v2' AND MERCHANT_QUALITY_SCORE IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY COMPANY_ID ORDER BY COMPANY_ID) = 1
+  ) prod_v2 ON TO_VARCHAR(prod_v2.COMPANY_ID) = TO_VARCHAR(a.HUBSPOT_COMPANY_ID)
+  LEFT JOIN PC_FIVETRAN_DB.RISK_MODELING.MERCHANT_UW_V2_KAFENE_SCORES retro_v2 ON retro_v2.COMPANY_ID = TO_VARCHAR(a.HUBSPOT_COMPANY_ID)
+  LEFT JOIN PC_FIVETRAN_DB.HUBSPOT.DEAL deal ON deal.DEAL_ID = a.HUBSPOT_DEAL_ID
+;
