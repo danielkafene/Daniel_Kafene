@@ -1,3 +1,5 @@
+--test for mirror push
+
 -- MHR pivot data with hubspot company backfill join for MQS_V2
 -- Co-authored with CoCo
 create or replace table PC_FIVETRAN_DB.YISHUANG_TEMP.MHR_PIVOT_DATA as 
