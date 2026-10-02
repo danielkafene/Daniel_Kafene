@@ -1,0 +1,124 @@
+# Whenever "MHR SQL" is pushed to main (by the mirror Action from kafeneleasing/merchant_risk),
+# write the full file into PC_FIVETRAN_DB.DANIEL_X.MHR_SCRIPTS, row name = 'MHR_DANIEL_COPY'.
+#
+# Order: back up old row -> explain compile check -> write -> md5/length verification -> commit
+# Any failure: the whole transaction rolls back (no backup left behind), build fails, table unchanged.
+#
+# Location: .github/workflows/sync-mhr-script-to-snowflake.yml in danielkafene/Daniel_Kafene
+# Required repo secrets (Daniel_Kafene -> Settings -> Secrets and variables -> Actions):
+#   SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PRIVATE_KEY / SNOWFLAKE_ROLE / SNOWFLAKE_WAREHOUSE
+#   The role needs: read on PRODUCTION_PUBLIC and other source tables (for explain) + read/write on DANIEL_X.MHR_SCRIPTS
+
+name: Sync MHR SQL to Snowflake MHR_SCRIPTS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'MHR SQL'
+  workflow_dispatch:
+
+concurrency:
+  group: mhr-script-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install "snowflake-connector-python>=3.6" cryptography
+
+      - name: Backup, compile-check, write, verify
+        env:
+          SF_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SF_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SF_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+          SF_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SF_WH: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: |
+          python - <<'PY'
+          import os, sys, hashlib, datetime, zoneinfo
+          import snowflake.connector
+          from cryptography.hazmat.primitives import serialization
+
+          TABLE = "PC_FIVETRAN_DB.DANIEL_X.MHR_SCRIPTS"
+          NAME = "MHR_DANIEL_COPY"
+
+          script = open("MHR SQL", encoding="utf-8").read()   # stored exactly as-is
+          local_md5 = hashlib.md5(script.encode("utf-8")).hexdigest()
+          local_len = len(script)
+          print(f"Local file: {local_len:,} chars, md5 {local_md5}")
+
+          key = serialization.load_pem_private_key(os.environ["SF_KEY"].encode(), password=None)
+          pkb = key.private_bytes(serialization.Encoding.DER,
+                                  serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption())
+          con = snowflake.connector.connect(
+              account=os.environ["SF_ACCOUNT"], user=os.environ["SF_USER"], private_key=pkb,
+              role=os.environ["SF_ROLE"], warehouse=os.environ["SF_WH"],
+              database="PC_FIVETRAN_DB", schema="PRODUCTION_PUBLIC",  # same context the scheduled job runs in
+              autocommit=False,
+          )
+          cur = con.cursor()
+
+          def fail(msg):
+              con.rollback()
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          # 0. Current row must exist; skip if content is already identical
+          cur.execute(f"select md5(script), length(script) from {TABLE} where name = %s", (NAME,))
+          rows = cur.fetchall()
+          if len(rows) != 1:
+              fail(f"Expected exactly 1 row with name = {NAME}, found {len(rows)}")
+          if rows[0][0] == local_md5:
+              print("Snowflake already has this exact script — nothing to do.")
+              sys.exit(0)
+
+          try:
+              cur.execute("begin")
+
+              # 1. Back up the old row (all columns, incl. original updated_at). A second sync on the same day gets a time suffix
+              now_et = datetime.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+              bak = f"{NAME}_BAK_{now_et:%Y%m%d}"
+              cur.execute(f"select count(*) from {TABLE} where name = %s", (bak,))
+              if cur.fetchone()[0] > 0:
+                  bak = f"{bak}_{now_et:%H%M%S}"
+              cur.execute(f"insert into {TABLE} select * replace (%s as name) from {TABLE} where name = %s",
+                          (bak, NAME))
+              print(f"Backed up current row as {bak}")
+
+              # 2. Compile check: explain only, no execution. Equivalent to EXECUTE IMMEDIATE 'explain ' || script
+              try:
+                  cur.execute("explain " + script.strip().rstrip(";"))
+              except Exception as e:
+                  fail(f"Compile check (explain) failed — nothing written. {e}")
+              print("Compile check passed")
+
+              # 3. Write
+              cur.execute(f"update {TABLE} set script = %s, updated_at = current_timestamp() where name = %s",
+                          (script, NAME))
+
+              # 4. Byte-for-byte verification
+              cur.execute(f"select md5(script), length(script) from {TABLE} where name = %s", (NAME,))
+              sf_md5, sf_len = cur.fetchone()
+              if sf_md5 != local_md5 or sf_len != local_len:
+                  fail(f"Verification failed: Snowflake md5 {sf_md5} / len {sf_len} "
+                       f"vs file md5 {local_md5} / len {local_len}")
+
+              con.commit()
+              print(f"Done: {NAME} updated ({sf_len:,} chars, md5 {sf_md5}); backup = {bak}")
+          except SystemExit:
+              raise
+          except Exception as e:
+              fail(f"Sync failed, rolled back: {e}")
+          finally:
+              con.close()
+          PY
