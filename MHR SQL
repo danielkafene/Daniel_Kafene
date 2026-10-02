@@ -1,8 +1,5 @@
 -- MHR pivot data with hubspot company backfill join for MQS_V2
 -- Co-authored with CoCo
-
-USE SCHEMA PC_FIVETRAN_DB.PRODUCTION_PUBLIC;
-
 create or replace table PC_FIVETRAN_DB.YISHUANG_TEMP.MHR_PIVOT_DATA as 
 --refresh related ticket and related store_id
 with MR_DDM_TICKET_FLAGGING AS (
@@ -15,8 +12,8 @@ WITH TMP1 AS
         LISTAGG(DISTINCT A.pricing_tag, ', ') WITHIN GROUP (ORDER BY A.pricing_tag) AS pricing_tags,
         SUM(A.CONTRACTED_AMOUNT_LAST_CALENDAR_MONTH) AS CONTRACTED_AMOUNT_LAST_CALENDAR_MONTH,
         SUM(A.MAXIMUM_CONTRACTED_AMOUNT) AS MAXIMUM_CONTRACTED_AMOUNT
-    FROM STG_STORE_HISTORY AS A
-    LEFT JOIN STG_STORE AS B ON A.ID = B.ID
+    FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_HISTORY AS A
+    LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE AS B ON A.ID = B.ID
     --WHERE A.AS_OF_DATE = '2026-01-26' AND A.IS_STORE_LEVEL_BLOCKED = 'FALSE'
     --AND A.CATEGORY_NAME = 'Jewelry'
     GROUP BY b.PROPERTY_CHAIN_ID
@@ -27,8 +24,8 @@ SELECT
     B.PROPERTY_CHAIN_ID,
     A.KEY,
     MAX(A.TICKET_CREATED_AT) AS  TICKET_CREATED_AT
-FROM STG_STORE_RETENTION_PERIOD AS A
-LEFT JOIN STG_STORE AS B ON A.STORE_ID = B.ID
+FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE_RETENTION_PERIOD AS A
+LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE AS B ON A.STORE_ID = B.ID
 GROUP BY 1,2
 )
 --SELECT * FROM TMP2
@@ -80,8 +77,8 @@ tmp4b as
     --s.id AS store_id,
     s.property_chain_id,
     min(coalesce(param_1_min,2)) AS BV_MIN, max(coalesce(param_1_max,10)) AS BV_MAX
-    FROM  store_treatment.merchant_flag_treatment mft
-    LEFT JOIN stg_store s ON s.merchant_id = mft.merchant_id
+    FROM  PC_FIVETRAN_DB.STORE_TREATMENT.MERCHANT_FLAG_TREATMENT mft
+    LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE s ON s.merchant_id = mft.merchant_id
     where flag_id = 'flag_00292' and s.is_store_level_blocked = 'FALSE'
     group by 1
 )
@@ -234,7 +231,7 @@ ceil(floor(overlay_00136)/50)*50 end ) as overlay_00049,
 
         from
           PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_simulation_line_prod_step3 a
-      left join stg_merchant_line_treatment_simu global_cap
+      left join PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_MERCHANT_LINE_TREATMENT_SIMU global_cap
 on a.merchant_id = global_cap.merchant_id
 and global_cap.treatment_type = 'glob_cap'
 and global_cap.as_of_date = a.application_date
@@ -249,7 +246,7 @@ and (a.d30_180d_model_q325 <= global_cap.d30_180d_max or global_cap.d30_180d_max
 
 QUALIFY ROW_NUMBER() OVER (PARTITION BY a.application_id ORDER BY a.created_at DESC) = 1
       ) a
-      left join stg_underwriting_metrics uw on uw.application_id = a.application_id
+      left join PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_METRICS uw on uw.application_id = a.application_id
   ),
   --------swap in date subquery---
   swap_in_date AS (
@@ -625,7 +622,7 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY a.application_id ORDER BY a.created_at D
     company_id,
     MAX(model_run_date) AS latest_date
   FROM 
-    stg_merchant_underwriting_scores
+    PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_MERCHANT_UNDERWRITING_SCORES
   GROUP BY 
     company_id
 )
@@ -646,9 +643,9 @@ SELECT
             else null
             end as store_final_coc_prediction_band
 FROM 
-  stg_store s
+  PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE s
 JOIN 
-  stg_merchant_underwriting_scores mus
+  PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_MERCHANT_UNDERWRITING_SCORES mus
   ON s.hubspot_company_id = mus.company_id
 JOIN 
   latest_scores ls
@@ -1302,7 +1299,7 @@ END AS CA_HIGH_EPO1_PRICING_CHANGE_FLAG,
       CASE 
     WHEN s.merchant_id IN (
         SELECT merchant_id
-        FROM store_treatment.merchant_flag_treatment
+        FROM PC_FIVETRAN_DB.STORE_TREATMENT.MERCHANT_FLAG_TREATMENT
         WHERE flag_id = 'flag_00289'
     ) THEN 1 
     ELSE 0 
@@ -1566,7 +1563,7 @@ END AS swap_in_treatment_flag,
         ELSE 0
       END AS customer_channel_cnt,
       CASE  
-        WHEN UW.APPLICATION_ID IN (SELECT APPLICATION_ID FROM stg_formpiper_applications) THEN 1
+        WHEN UW.APPLICATION_ID IN (SELECT APPLICATION_ID FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_FORMPIPER_APPLICATIONS) THEN 1
         ELSE 0
       END AS formpiper_app_flag,
       CASE 
@@ -1707,7 +1704,7 @@ swapin.swapin_group_flag,
         PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_METRICS uw
      -- left join PC_FIVETRAN_DB.YISHUANG_TEMP.step6_TODAY_11112025 swap_sim on swap_sim.application_id = uw.application_id
       left join
-    stg_application_model_scores_hourly as model_score
+    PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_APPLICATION_MODEL_SCORES_HOURLY as model_score
     on uw.application_id = model_score.application_id
       left join (with base as(
 SELECT 
@@ -1731,7 +1728,7 @@ SELECT
         END AS TREATMENT_GRADE
  --       MIN(t.as_of_date),
 --        MAX(t.as_of_date)
-    FROM stg_underwriting_merchant_flag_treatment t
+    FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT t
     left JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.stg_store s ON s.merchant_id = t.merchant_id
     WHERE t.flag_id = 'flag_00289' and treatment_grade is not null
     GROUP BY s.merchant_id,
@@ -1771,7 +1768,7 @@ SELECT
             model_scores,
             decision_engine_output,
             metadata
-        from stg_uw_make_decision_archive_prod
+        from PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UW_MAKE_DECISION_ARCHIVE_PROD
         qualify
             row_number() over (
                 partition by application_id
@@ -1783,16 +1780,16 @@ SELECT
     on uw.application_id = uw_s3.application_id
       LEFT JOIN original_pricing OP ON OP.LEASE_ID = UW.LEASE_ID
       LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.LEASE ON LEASE.ID = UW.LEASE_ID
-      LEFT JOIN s3.merchant_risk_tire_appliance_zone_20230707 AS zone_coc on zone_coc.zipcode = s.zipcode
+      LEFT JOIN PC_FIVETRAN_DB.S3.MERCHANT_RISK_TIRE_APPLIANCE_ZONE_20230707 AS zone_coc on zone_coc.zipcode = s.zipcode
       LEFT JOIN ONE_DOLLAR_TABLE AS od ON od.store_id = uw.store_id
       LEFT JOIN STORE_COC_SCORE AS scs on scs.id = uw.store_id
       LEFT JOIN EPO1_120_DAY_TABLE AS epo120 ON epo120.store_id = uw.store_id
 
       
-      left join risk_modeling.kafene_stores_image_model_scores image_ms on image_ms.store_id = uw.store_id
+      left join PC_FIVETRAN_DB.RISK_MODELING.KAFENE_STORES_IMAGE_MODEL_SCORES image_ms on image_ms.store_id = uw.store_id
 
       
-      left join risk_modeling.lto_competitor_score_scores_20250911_sw_rev merchant_ms on merchant_ms.kafene_store_id = uw.store_id
+      left join PC_FIVETRAN_DB.RISK_MODELING.LTO_COMPETITOR_SCORE_SCORES_20250911_SW_REV merchant_ms on merchant_ms.kafene_store_id = uw.store_id
       left join (
   select
     customer.description as application_id,
@@ -1800,14 +1797,14 @@ SELECT
     sum(dispute.amount)/100 as dispute_amount,
     sum(case when dispute.reason = 'fraudulent' then dispute.amount else 0 end)/100 as fraud_dispute_amount,
     count(case when dispute.reason = 'fraudulent' then dispute.id else null end) as fraud_dispute_count
-  from stripe.customer
-  left join stripe.charge on customer.id = charge.customer_id
-  left join stripe.dispute on charge.id = dispute.charge_id
+  from PC_FIVETRAN_DB.STRIPE.CUSTOMER
+  left join PC_FIVETRAN_DB.STRIPE.CHARGE on customer.id = charge.customer_id
+  left join PC_FIVETRAN_DB.STRIPE.DISPUTE on charge.id = dispute.charge_id
   group by application_id
 ) disputes ON UW.application_id = disputes.application_id
       LEFT JOIN (
         SELECT application_id, final_projected_dollars, initial_lease_principle
-        FROM STG_COC_PROJECTIONS_RISK
+        FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_COC_PROJECTIONS_RISK
         WHERE current_value_flag = 1
         ) AS i ON i.application_id = uw.application_id
       --LEFT JOIN "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."APPLICATIONS" AS appl ON appl.id = uw.application_id
@@ -1877,7 +1874,7 @@ SELECT
         END
       ) AS missing_cbb_cnt
     FROM
-      s3.clarity_s_3
+      PC_FIVETRAN_DB.S3.CLARITY_S_3
     GROUP BY
       1,
       2
@@ -1990,7 +1987,7 @@ FROM
   LEFT JOIN merchant_store_cnt c ON a.merchant_id = c.merchant_id
   LEFT JOIN chain_store_cnt CC ON Cc.PROPERTY_CHAIN_ID = A.PROPERTY_CHAIN_ID
   LEFT JOIN cbb_score cbb ON cbb.application_id = a.application_id
-  left join stg_uw_simulation_prod_final ff on ff.APPLICATION_ID = a.APPLICATION_ID
+  left join PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UW_SIMULATION_PROD_FINAL ff on ff.APPLICATION_ID = a.APPLICATION_ID
   LEFT JOIN (
     SELECT
   store_id,
@@ -2042,7 +2039,7 @@ GROUP BY
             subquery.rn <= 1
   ) AS max_tickets ON max_tickets.store_id = a.store_id
   LEFT JOIN PC_FIVETRAN_DB.NATHAN_TEMP.SUPERCHARGE_FLAG_TABLE SFT ON SFT.STORE_ID = A.STORE_ID
-  LEFT JOIN (select application_id,COC_PROJ_SIMPLE,FRAUD_MODEL_Q325 from stg_simulation_attributes_prod) MS ON MS.APPLICATION_ID = A.APPLICATION_ID
+  LEFT JOIN (select application_id,COC_PROJ_SIMPLE,FRAUD_MODEL_Q325 from PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_SIMULATION_ATTRIBUTES_PROD) MS ON MS.APPLICATION_ID = A.APPLICATION_ID
   LEFT JOIN MR_DDM_TICKET_FLAGGING MDTF ON A.property_chain_id = mdtf.property_chain_id
   LEFT JOIN (SELECT 
     merchant_id,
@@ -2065,8 +2062,8 @@ FROM (
             WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min = 0.0671 AND param_2_max = 0.1017 THEN 12
             WHEN param_1_min IS NULL AND param_1_max = 0.9765 AND param_2_min = 0.1017 AND param_2_max IS NULL THEN 13
         END AS treatment_group
-    FROM store_treatment.merchant_flag_treatment mft
-    LEFT JOIN stg_store s 
+            FROM PC_FIVETRAN_DB.STORE_TREATMENT.MERCHANT_FLAG_TREATMENT mft
+    LEFT JOIN PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_STORE s 
         ON s.merchant_id = mft.merchant_id
 
    -- WHERE flag_id = 'flag_00289'
