@@ -1,7 +1,8 @@
---test for mirror push
-
 -- MHR pivot data with hubspot company backfill join for MQS_V2
 -- Co-authored with CoCo
+
+USE SCHEMA PC_FIVETRAN_DB.PRODUCTION_PUBLIC;
+
 create or replace table PC_FIVETRAN_DB.YISHUANG_TEMP.MHR_PIVOT_DATA as 
 --refresh related ticket and related store_id
 with MR_DDM_TICKET_FLAGGING AS (
