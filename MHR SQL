@@ -687,6 +687,57 @@ JOIN
       )
     GROUP BY 1
   ),
+  ---- Supercharge at application date: store-scoped rows (flattened) ----
+  sc_app_store AS (
+    SELECT
+        f.value::STRING AS store_id,
+        t.as_of_date,
+        CASE
+            WHEN t.PARAM_1_MAX = 0.386 THEN '15'
+            WHEN t.PARAM_1_MAX = 0.333 THEN '10a'
+            WHEN t.PARAM_1_MAX = 0.260 THEN '5a'
+            WHEN t.PARAM_1_MAX = 0.316 THEN '10b'
+            WHEN t.PARAM_1_MAX = 0.250 THEN '5b'
+            ELSE NULL
+        END AS supercharge_group
+    FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT t,
+         LATERAL FLATTEN(input => t.store_ids) f
+    WHERE t.flag_id = 'flag_00308'
+      -- old label (2026-06-12 to 2026-10-04) + new label (2026-09-01 onward), same thresholds
+      AND t.param_1_label IN ('model_scores:D30_180D_MODEL_Q325:score', 'model_pointers:D30_180D_MODEL')
+      AND t.store_scope = 'ONLY'
+      AND supercharge_group IS NOT NULL
+    -- one row per store per day (labels overlap + duplicate daily rows); prefer new label
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY f.value::STRING, t.as_of_date
+        ORDER BY IFF(t.param_1_label = 'model_pointers:D30_180D_MODEL', 0, 1), t.param_1_max DESC
+    ) = 1
+  ),
+  ---- Supercharge at application date: merchant-wide fallback ----
+  sc_app_merch AS (
+    SELECT
+        t.merchant_id,
+        t.as_of_date,
+        CASE
+            WHEN t.PARAM_1_MAX = 0.386 THEN '15'
+            WHEN t.PARAM_1_MAX = 0.333 THEN '10a'
+            WHEN t.PARAM_1_MAX = 0.260 THEN '5a'
+            WHEN t.PARAM_1_MAX = 0.316 THEN '10b'
+            WHEN t.PARAM_1_MAX = 0.250 THEN '5b'
+            ELSE NULL
+        END AS supercharge_group
+    FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT t
+    WHERE t.flag_id = 'flag_00308'
+      -- old label (2026-06-12 to 2026-10-04) + new label (2026-09-01 onward), same thresholds
+      AND t.param_1_label IN ('model_scores:D30_180D_MODEL_Q325:score', 'model_pointers:D30_180D_MODEL')
+      AND t.store_scope IS NULL
+      AND supercharge_group IS NOT NULL
+    -- one row per merchant per day (labels overlap + duplicate daily rows); prefer new label
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY t.merchant_id, t.as_of_date
+        ORDER BY IFF(t.param_1_label = 'model_pointers:D30_180D_MODEL', 0, 1), t.param_1_max DESC
+    ) = 1
+  ),
   pivot_base AS (
     SELECT
       uw.application_id,
@@ -1002,7 +1053,7 @@ END AS approval_amount_band_v2,
         when hp.pricing_tag is not null then 'Bespoke pricing'
         else 'Standard pricing'
       end as app_date_pricing_flag,
-      s.property_time_in_business_sync_,
+      hc.PROPERTY_TIME_IN_BUSINESS_SYNC,
       i.final_projected_dollars AS yu_final_projected_dollars,
       i.initial_lease_principle AS yu_initial_lease_principle,
       o.sim_decision,
@@ -1752,6 +1803,7 @@ SELECT
             select merchant_id,max(treatment_grade) as swapin_group_flag from base where merchant_id is not null group by 1
             ) swapin on swapin.merchant_id = uw.merchant_id
       LEFT JOIN "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."STG_STORE" AS s ON uw.store_id = s.id
+      LEFT JOIN "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."STG_HUBSPOT_COMPANY" AS hc ON s.hubspot_company_id = hc.id
       LEFT JOIN activation_terms act ON act.store_id = s.id
       LEFT JOIN "PC_FIVETRAN_DB"."PRODUCTION_PUBLIC"."APPLICATIONS" AS a ON a.id = uw.application_id
       LEFT JOIN  PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_PRICING_HISTORY AS pricing   
@@ -1917,6 +1969,9 @@ SELECT DISTINCT
   END AS APPS_DURING_SWAP_IN_TREATMENT_FLAG,
   SFT.BET_OPEN_DATE,
   SFT.bet_active as store_bet_active,
+  ---- Supercharge flag at application date (respects treatment removal) ----
+  CASE WHEN COALESCE(sc_app_store.supercharge_group, sc_app_merch.supercharge_group) IS NOT NULL THEN 1 ELSE 0 END AS app_supercharge_flag,
+  COALESCE(sc_app_store.supercharge_group, sc_app_merch.supercharge_group) AS app_supercharge_group,
  MDTF.related_keys,
  MDTF.most_recent_key_date,
  MDTF.most_recent_key,
@@ -2039,6 +2094,11 @@ GROUP BY
             subquery.rn <= 1
   ) AS max_tickets ON max_tickets.store_id = a.store_id
   LEFT JOIN PC_FIVETRAN_DB.NATHAN_TEMP.SUPERCHARGE_FLAG_TABLE SFT ON SFT.STORE_ID = A.STORE_ID
+  ---- Supercharge at app date: store-level wins, merchant-level fallback ----
+  LEFT JOIN sc_app_store ON sc_app_store.store_id = a.store_id
+                        AND sc_app_store.as_of_date = a.application_created_at_ymd
+  LEFT JOIN sc_app_merch ON sc_app_merch.merchant_id = a.merchant_id
+                        AND sc_app_merch.as_of_date = a.application_created_at_ymd
   LEFT JOIN (select application_id,COC_PROJ_SIMPLE,FRAUD_MODEL_Q325 from PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_SIMULATION_ATTRIBUTES_PROD) MS ON MS.APPLICATION_ID = A.APPLICATION_ID
   LEFT JOIN MR_DDM_TICKET_FLAGGING MDTF ON A.property_chain_id = mdtf.property_chain_id
   LEFT JOIN (SELECT 
