@@ -738,76 +738,6 @@ JOIN
         ORDER BY IFF(t.param_1_label = 'model_pointers:D30_180D_MODEL', 0, 1), t.param_1_max DESC
     ) = 1
   ),
-  ---- Current supercharge per store (today's snapshot, store-scoped) ----
-  sc_current_store AS (
-    SELECT
-        f.value::STRING AS store_id,
-        CASE
-            WHEN t.PARAM_1_MAX = 0.386 THEN '15'
-            WHEN t.PARAM_1_MAX = 0.333 THEN '10a'
-            WHEN t.PARAM_1_MAX = 0.260 THEN '5a'
-            WHEN t.PARAM_1_MAX = 0.316 THEN '10b'
-            WHEN t.PARAM_1_MAX = 0.250 THEN '5b'
-        END AS current_supercharge_group,
-        MIN(t.as_of_date) AS supercharge_start_date
-    FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT t,
-         LATERAL FLATTEN(input => t.store_ids) f
-    WHERE t.flag_id = 'flag_00308'
-      AND t.param_1_label IN ('model_scores:D30_180D_MODEL_Q325:score', 'model_pointers:D30_180D_MODEL')
-      AND t.store_scope = 'ONLY'
-      AND CASE
-            WHEN t.PARAM_1_MAX = 0.386 THEN '15'
-            WHEN t.PARAM_1_MAX = 0.333 THEN '10a'
-            WHEN t.PARAM_1_MAX = 0.260 THEN '5a'
-            WHEN t.PARAM_1_MAX = 0.316 THEN '10b'
-            WHEN t.PARAM_1_MAX = 0.250 THEN '5b'
-          END IS NOT NULL
-      -- only stores that still have supercharge as of the latest snapshot
-      AND f.value::STRING IN (
-          SELECT f2.value::STRING
-          FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT t2,
-               LATERAL FLATTEN(input => t2.store_ids) f2
-          WHERE t2.flag_id = 'flag_00308'
-            AND t2.param_1_label IN ('model_scores:D30_180D_MODEL_Q325:score', 'model_pointers:D30_180D_MODEL')
-            AND t2.store_scope = 'ONLY'
-            AND t2.as_of_date = (SELECT MAX(as_of_date) FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT WHERE flag_id = 'flag_00308')
-      )
-    GROUP BY 1, 2
-  ),
-  ---- Current supercharge per merchant (merchant-wide fallback) ----
-  sc_current_merch AS (
-    SELECT
-        t.merchant_id,
-        CASE
-            WHEN t.PARAM_1_MAX = 0.386 THEN '15'
-            WHEN t.PARAM_1_MAX = 0.333 THEN '10a'
-            WHEN t.PARAM_1_MAX = 0.260 THEN '5a'
-            WHEN t.PARAM_1_MAX = 0.316 THEN '10b'
-            WHEN t.PARAM_1_MAX = 0.250 THEN '5b'
-        END AS current_supercharge_group,
-        MIN(t.as_of_date) AS supercharge_start_date
-    FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT t
-    WHERE t.flag_id = 'flag_00308'
-      AND t.param_1_label IN ('model_scores:D30_180D_MODEL_Q325:score', 'model_pointers:D30_180D_MODEL')
-      AND t.store_scope IS NULL
-      AND CASE
-            WHEN t.PARAM_1_MAX = 0.386 THEN '15'
-            WHEN t.PARAM_1_MAX = 0.333 THEN '10a'
-            WHEN t.PARAM_1_MAX = 0.260 THEN '5a'
-            WHEN t.PARAM_1_MAX = 0.316 THEN '10b'
-            WHEN t.PARAM_1_MAX = 0.250 THEN '5b'
-          END IS NOT NULL
-      -- only merchants that still have supercharge as of the latest snapshot
-      AND t.merchant_id IN (
-          SELECT t2.merchant_id
-          FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT t2
-          WHERE t2.flag_id = 'flag_00308'
-            AND t2.param_1_label IN ('model_scores:D30_180D_MODEL_Q325:score', 'model_pointers:D30_180D_MODEL')
-            AND t2.store_scope IS NULL
-            AND t2.as_of_date = (SELECT MAX(as_of_date) FROM PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_UNDERWRITING_MERCHANT_FLAG_TREATMENT WHERE flag_id = 'flag_00308')
-      )
-    GROUP BY 1, 2
-  ),
   pivot_base AS (
     SELECT
       uw.application_id,
@@ -2042,10 +1972,6 @@ SELECT DISTINCT
   ---- Supercharge flag at application date (respects treatment removal) ----
   CASE WHEN COALESCE(sc_app_store.supercharge_group, sc_app_merch.supercharge_group) IS NOT NULL THEN 1 ELSE 0 END AS app_supercharge_flag,
   COALESCE(sc_app_store.supercharge_group, sc_app_merch.supercharge_group) AS app_supercharge_group,
-  ---- Current supercharge status for the store (is it supercharged right now?) ----
-  CASE WHEN COALESCE(sc_current_store.current_supercharge_group, sc_current_merch.current_supercharge_group) IS NOT NULL THEN 1 ELSE 0 END AS store_current_supercharge_flag,
-  COALESCE(sc_current_store.current_supercharge_group, sc_current_merch.current_supercharge_group) AS store_current_supercharge_group,
-  COALESCE(sc_current_store.supercharge_start_date, sc_current_merch.supercharge_start_date) AS store_supercharge_start_date,
  MDTF.related_keys,
  MDTF.most_recent_key_date,
  MDTF.most_recent_key,
@@ -2173,9 +2099,6 @@ GROUP BY
                         AND sc_app_store.as_of_date = a.application_created_at_ymd
   LEFT JOIN sc_app_merch ON sc_app_merch.merchant_id = a.merchant_id
                         AND sc_app_merch.as_of_date = a.application_created_at_ymd
-  ---- Current supercharge: store-level wins, merchant-level fallback ----
-  LEFT JOIN sc_current_store ON sc_current_store.store_id = a.store_id
-  LEFT JOIN sc_current_merch ON sc_current_merch.merchant_id = a.merchant_id
   LEFT JOIN (select application_id,COC_PROJ_SIMPLE,FRAUD_MODEL_Q325 from PC_FIVETRAN_DB.PRODUCTION_PUBLIC.STG_SIMULATION_ATTRIBUTES_PROD) MS ON MS.APPLICATION_ID = A.APPLICATION_ID
   LEFT JOIN MR_DDM_TICKET_FLAGGING MDTF ON A.property_chain_id = mdtf.property_chain_id
   LEFT JOIN (SELECT 
@@ -2213,5 +2136,12 @@ GROUP BY merchant_id) as SIG on SIG.MERCHANT_ID = A.MERCHANT_ID
     QUALIFY ROW_NUMBER() OVER (PARTITION BY COMPANY_ID ORDER BY COMPANY_ID) = 1
   ) prod_v2 ON TO_VARCHAR(prod_v2.COMPANY_ID) = TO_VARCHAR(a.HUBSPOT_COMPANY_ID)
   LEFT JOIN PC_FIVETRAN_DB.RISK_MODELING.MERCHANT_UW_V2_KAFENE_SCORES retro_v2 ON retro_v2.COMPANY_ID = TO_VARCHAR(a.HUBSPOT_COMPANY_ID)
-  LEFT JOIN PC_FIVETRAN_DB.HUBSPOT.DEAL deal ON deal.DEAL_ID = a.HUBSPOT_DEAL_ID
+  LEFT JOIN (
+    SELECT property_store_id, property_termination_reason
+    FROM PC_FIVETRAN_DB.HUBSPOT.DEAL
+    WHERE property_store_id IS NOT NULL
+      AND property_termination_reason IS NOT NULL
+      AND property_termination_reason != ''
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY property_store_id ORDER BY property_closedate DESC NULLS LAST, property_createdate DESC) = 1
+  ) deal ON deal.property_store_id = a.store_id
 ;
